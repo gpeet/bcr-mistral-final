@@ -17,7 +17,7 @@ set -euo pipefail
 
 # The processed data and TRUST4 assemblies share one Zenodo record (CC BY 4.0). The model weights are
 # on the Hugging Face Hub instead, under the repository's own terms; see LICENSE.
-ZENODO_DATA_RECORD=${ZENODO_DATA_RECORD:-20432913}
+ZENODO_DATA_RECORD=${ZENODO_DATA_RECORD:-23605219}   # v1.0.1; 10.5281/zenodo.20432912 is all versions
 HF_REPO=${HF_REPO:-grpeet/bcr-mistral}           # access is gated: accept the terms on the model page first
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)

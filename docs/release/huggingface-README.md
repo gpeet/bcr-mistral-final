@@ -33,7 +33,7 @@ Decoder-only (Mistral-architecture) language models pretrained on human B cell r
 > Identification of Multiple Sclerosis-Associated BCRs and Repertoires.* (citation to be added)
 
 Code and figure reproduction: https://github.com/gpeet/bcr-mistral-final
-Processed data and TRUST4 assemblies: Zenodo, doi:10.5281/zenodo.20432913
+Processed data and TRUST4 assemblies: Zenodo, doi:10.5281/zenodo.23605219 (all versions: 10.5281/zenodo.20432912)
 
 `scripts/fetch_data.sh models` in the repository downloads this repo into the layout the pipeline
 expects. `SHA256SUMS` covers every file.
@@ -46,7 +46,7 @@ examine or verify the results in the paper; any other use, including redistribut
 commercial use, needs written permission. See `LICENSE`, and contact Graham Peet
 (graham.peet@cuanschutz.edu).
 
-The processed data record (doi:10.5281/zenodo.20432913) is licensed separately under CC BY 4.0.
+The processed data record (doi:10.5281/zenodo.23605219) is licensed separately under CC BY 4.0.
 
 ## Models
 

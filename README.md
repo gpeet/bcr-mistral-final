@@ -109,11 +109,16 @@ not reproduced here.
 
 | What | Where | `scripts/fetch_data.sh` |
 |---|---|---|
-| Processed data: metadata, labelled classifier sets, pretraining corpora, triplet test set, Fig. 1F-H table, baseline predictions (~6 GB unpacked) | Zenodo [10.5281/zenodo.20432913](https://doi.org/10.5281/zenodo.20432913) | `data` |
+| Processed data: metadata, labelled classifier sets, pretraining corpora, triplet test set, Fig. 1F-H table, baseline predictions (~6 GB unpacked) | Zenodo [10.5281/zenodo.23605219](https://doi.org/10.5281/zenodo.23605219) | `data` |
 | TRUST4 assemblies, one AIRR file per run (~47 GB unpacked): needed for Fig. 1I and 1E / Table S1, and to rebuild the dataset | the same Zenodo record | `trust4` |
 | BCR-Mistral weights, transformers config, tokenizers, trained classifiers and waypoint models | Hugging Face [grpeet/bcr-mistral](https://huggingface.co/grpeet/bcr-mistral) (gated: accept the terms on the model page) | `models` |
 | Owens et al. CSF plasmablast antibody sequences (Fig. 3D): not public | On request from Graham Peet (graham.peet@cuanschutz.edu); set `OWENS_BUNDLE` to the folder | `owens` |
 | Raw repertoires | NCBI SRA (accessions in the metadata table) and OPIG/OAS | rebuild stages |
+
+The Zenodo link above is version 1.0.1, the version these files were released as;
+[10.5281/zenodo.20432912](https://doi.org/10.5281/zenodo.20432912) resolves to the latest version
+instead. `scripts/fetch_data.sh` pins the version, so it fetches the same files every time;
+`ZENODO_DATA_RECORD` overrides it.
 
 Without the TRUST4 assemblies, `workflow/run.sh figures` skips Fig. 1E / Table S1 and 1I and says so.
 The master sequence tables are not distributed; `master-trust4` and `master-opig` rebuild them.
