@@ -1,0 +1,232 @@
+---
+title: "Embedding Classifier Evaluation"
+---
+
+```{r setup}
+source(here::here("R", "paths.R"))
+library(tidyverse)
+
+FIGURES_DIR <- out_path("figures")
+dir.create(FIGURES_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r load-predictions}
+# ── Paths ──────────────────────────────────────────────────────────────────────
+BASE <- out_path("sequence-classifier")
+
+ENSEMBLE_DIRS <- list(
+  "LM Exclusion AUGC" = file.path(BASE, "ensemble-output-exclusion"),
+  "LM Baseline AUGC"  = file.path(BASE, "ensemble-output-baseline")
+)
+
+COMPARATOR_MODELS <- c(
+  "sequence_kmer_glm",
+  "sequence_kmer_rf",
+  "vdj_protein_glm",
+  "vdj_protein_rf"
+)
+
+COMPARATOR_LABELS <- c(
+  sequence_kmer_glm     = "Sequence k-mer GLM",
+  sequence_kmer_rf      = "Sequence k-mer RF",
+  vdj_protein_glm       = "VDJ protein GLM",
+  vdj_protein_rf        = "VDJ protein RF"
+)
+
+COMPARATOR_BASE <- file.path(BASE, "comparator-output")
+
+# ── Helper ─────────────────────────────────────────────────────────────────────
+load_ensemble <- function(dir, model_label) {
+  bind_rows(
+    read_csv(file.path(dir, "unflipped/predictions/ensemble_predictions.csv"),
+             show_col_types = FALSE),
+    read_csv(file.path(dir, "flipped/predictions/ensemble_predictions.csv"),
+             show_col_types = FALSE)
+  ) %>%
+    dplyr::rename(
+      `prob_Multiple sclerosis` = ms_score,
+      Predicted                 = predicted_class,
+      Disease                   = true_label
+    ) %>%
+    mutate(Disease_orig = Disease, model = model_label)
+}
+
+# ── LM models ─────────────────────────────────────────────────────────────────
+lm_preds <- imap(ENSEMBLE_DIRS, load_ensemble)
+
+# ── Comparator models ──────────────────────────────────────────────────────────
+comp_preds <- map(COMPARATOR_MODELS, function(m) {
+  load_ensemble(file.path(COMPARATOR_BASE, m), COMPARATOR_LABELS[[m]])
+})
+
+# ── Combine and filter ─────────────────────────────────────────────────────────
+all_preds <-
+  c(lm_preds, comp_preds) %>%
+  map(select, `prob_Multiple sclerosis`, Disease, Disease_orig, Predicted, Author, Subject, model) %>%
+  reduce(bind_rows) %>%
+  mutate(
+    Predicted = if_else(Predicted == "Multiple sclerosis", "Multiple sclerosis", "Other"),
+    Disease   = if_else(Disease   == "Multiple sclerosis", "Multiple sclerosis", "Other")
+  ) %>%
+  # Remove known duplicate / confounded BioProjects
+  filter(Author != "PRJNA248475", Author != "PRJNA248411",
+         Author != "PRJNA866296") %>%
+  # Remove MS twins
+  mutate(Disease = if_else(str_detect(Subject, "Twin(?:1|2|3|4)\\.2"), "MS Twin", Disease)) %>%
+  mutate(Disease = if_else(str_detect(Subject, "SCNI"),                "MS Twin", Disease)) %>%
+  filter(Disease != "MS Twin") %>%
+  mutate(
+    Disease   = factor(Disease),
+    Predicted = factor(Predicted, levels = levels(Disease))
+  )
+```
+
+```{r model-order}
+LM_ORDER <- c(
+  "LM Exclusion AUGC",
+  "LM Baseline AUGC"
+)
+
+COMP_ORDER <- c(
+  "Sequence k-mer GLM",
+  "Sequence k-mer RF",
+  "VDJ protein GLM",
+  "VDJ protein RF"
+)
+
+MODEL_ORDER <- c(LM_ORDER, COMP_ORDER, "Random (permuted)")
+
+# Viridis palette keyed by model name (grey for null baseline)
+MODEL_COLOURS <- c(
+  setNames(
+    viridis::viridis(length(MODEL_ORDER) - 1L, option = "D", begin = 0.05, end = 0.9),
+    MODEL_ORDER[MODEL_ORDER != "Random (permuted)"]
+  ),
+  "Random (permuted)" = "grey70"
+)
+LM_COLOURS <- MODEL_COLOURS[c(LM_ORDER, "Random (permuted)")]
+```
+
+```{r prior}
+# Prior = MS prevalence in the evaluation set (random baseline achieves this)
+prior_main <- all_preds %>%
+  filter(model == "LM Exclusion AUGC") %>%
+  summarize(p = mean(Disease == "Multiple sclerosis")) %>%
+  pull(p)
+```
+
+```{r topk-fold-curves}
+# Continuous precision & recall fold-enrichment curves across top-k thresholds.
+CURVE_MODELS  <- MODEL_ORDER[MODEL_ORDER != "Random (permuted)"]
+CURVE_X_START <- 0.5   # rightmost top-k fraction (top 50%)
+
+curve_fracs <- seq(CURVE_X_START, 0.00001, length.out = 200)
+
+curve_data <- map_dfr(CURVE_MODELS, function(mod) {
+  dat   <- all_preds %>% filter(model == mod)
+  n     <- nrow(dat)
+  n_pos <- sum(dat$Disease == "Multiple sclerosis")
+  map_dfr(curve_fracs, function(f) {
+    k    <- max(1L, round(n * f))
+    top  <- slice_max(dat, `prob_Multiple sclerosis`, n = k, with_ties = FALSE)
+    prec <- mean(top$Disease == "Multiple sclerosis")
+    rec  <- if (n_pos > 0) sum(top$Disease == "Multiple sclerosis") / n_pos else NA_real_
+    tibble(model = mod, frac = f,
+           precision = prec, recall = rec,
+           prec_fold = prec / prior_main,
+           rec_fold  = rec / frac)
+  })
+})
+
+CURVE_COLOURS <- MODEL_COLOURS[CURVE_MODELS]
+
+p_prec_curve <- ggplot(curve_data, aes(x = frac, y = prec_fold, colour = model)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  scale_x_reverse(labels = scales::percent_format()) +
+  scale_colour_manual(values = CURVE_COLOURS) +
+  theme_linedraw(base_size = 8) +
+  theme(panel.grid = element_blank(), legend.position = "inside", 
+        legend.position.inside = c(0.2, 0.2), aspect.ratio = 2) +
+  labs(x = "Top-k threshold", y = "Fold enrichment (precision / prior)",
+       title = "Precision fold enrichment across top-k", colour = NULL) +
+  scale_y_continuous(transform = 'log2', limits = c(0.5,2))
+p_prec_curve
+ggsave(file.path(FIGURES_DIR, "fig2E_precision_fold_curve.svg"),
+       p_prec_curve, width = 1.5, height = 3)
+
+```
+
+
+
+```{r nmo-benchmark}
+# Precision and AUPRC benchmarked on MS vs NMO only.
+# MS class restricted to BennettMS to match the BennettNMO cohort — using
+# all-study MS would create extreme class imbalance (>>100:1) making metrics
+# trivial.  Both cohorts are from the same lab so study effects are controlled.
+
+# Filter real models to NMO subset (exclude global permuted model — its
+# shuffled Disease labels cause wrong patients to be selected)
+nmo_preds <- all_preds %>%
+  filter(model %in% names(LM_COLOURS), model != "Random (permuted)") %>%
+  filter(
+    (Author == "BennettMS"  & Disease == "Multiple sclerosis") |
+    (Author == "BennettNMO" & Disease_orig == "Autoimmune Disease")
+  )
+
+# Create NMO-specific permuted null: shuffle Disease within the correct
+# NMO patient set so the null has the same patients and class balance
+set.seed(42)
+nmo_random <- nmo_preds %>%
+  filter(model == "LM Exclusion AUGC") %>%
+  mutate(
+    model   = "Random (permuted)",
+    Disease = sample(Disease)
+  )
+nmo_preds <- bind_rows(nmo_preds, nmo_random)
+
+# Ensure Disease is a proper two-level factor for yardstick
+nmo_preds <- nmo_preds %>%
+  mutate(Disease = factor(Disease, levels = c("Multiple sclerosis", "Other")))
+
+prior_nmo <- nmo_preds %>%
+  filter(model == "LM Exclusion AUGC") %>%
+  summarize(p = mean(Disease == "Multiple sclerosis")) %>%
+  pull(p)
+
+# ── NMO precision fold-enrichment curve ──────────────────────────────────────
+nmo_curve_fracs <- seq(CURVE_X_START, 0.00001, length.out = 200)
+nmo_curve_models <- names(LM_COLOURS)
+
+nmo_curve_data <- map_dfr(nmo_curve_models, function(mod) {
+  dat   <- nmo_preds %>% filter(model == mod)
+  n     <- nrow(dat)
+  map_dfr(nmo_curve_fracs, function(f) {
+    k    <- max(1L, round(n * f))
+    top  <- slice_max(dat, `prob_Multiple sclerosis`, n = k, with_ties = FALSE)
+    prec <- mean(top$Disease == "Multiple sclerosis")
+    tibble(model = mod, frac = f, prec_fold = prec / prior_nmo)
+  })
+})
+
+p_nmo_prec_curve <- ggplot(nmo_curve_data, aes(x = frac, y = prec_fold, colour = model)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  scale_x_reverse(labels = scales::percent_format()) +
+  scale_colour_manual(values = LM_COLOURS) +
+  theme_linedraw(base_size = 8) +
+  theme(panel.grid = element_blank(), legend.position = "inside",
+        legend.position.inside = c(0.2, 0.2), aspect.ratio = 2) +
+  labs(x = "Top-k threshold", y = "Fold enrichment (precision / prior)",
+       title = "MS vs NMO: precision fold enrichment across top-k", colour = NULL)
+# Linear, unclipped y axis as in the published S1B (the log2 axis limited to 0.5-2 used for 2E/2F
+# would drop most of the baseline curve, which falls below 0.5)
+
+p_nmo_prec_curve
+ggsave(file.path(FIGURES_DIR, "figS1B_nmo_precision_fold_curve.svg"),
+       p_nmo_prec_curve, width = 1.5, height = 3)
+
+```
+
+
+

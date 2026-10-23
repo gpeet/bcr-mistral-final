@@ -1,0 +1,221 @@
+---
+title: "Embedding Classifier Evaluation — Precision Variants"
+---
+
+```{r setup}
+source(here::here("R", "paths.R"))
+library(tidyverse)
+library(yardstick)
+library(rsample)
+```
+
+```{r load-predictions}
+# ── Paths ──────────────────────────────────────────────────────────────────────
+BASE <- out_path("sequence-classifier")
+
+ENSEMBLE_DIRS <- list(
+  "LM Exclusion AUGC"      = file.path(BASE, "ensemble-output-exclusion"),
+  "LM Baseline AUGC"       = file.path(BASE, "ensemble-output-baseline"),
+  "LM Exclusion Prec@5%"   = file.path(BASE, "ensemble-output-exclusion-precision"),
+  "LM Baseline Prec@5%"    = file.path(BASE, "ensemble-output-baseline-precision")
+)
+
+COMPARATOR_MODELS <- c(
+  "junction_kmer_glm",
+  "junction_kmer_rf",
+  "sequence_kmer_glm",
+  "sequence_kmer_rf",
+  "junction_protein_glm",
+  "junction_protein_rf",
+  "vdj_protein_glm",
+  "vdj_protein_rf",
+  "airr_metadata_glm",
+  "patient_metadata_glm"
+)
+
+COMPARATOR_LABELS <- c(
+  junction_kmer_glm     = "Junction k-mer GLM",
+  junction_kmer_rf      = "Junction k-mer RF",
+  sequence_kmer_glm     = "Sequence k-mer GLM",
+  sequence_kmer_rf      = "Sequence k-mer RF",
+  junction_protein_glm  = "Junction protein GLM",
+  junction_protein_rf   = "Junction protein RF",
+  vdj_protein_glm       = "VDJ protein GLM",
+  vdj_protein_rf        = "VDJ protein RF",
+  airr_metadata_glm     = "AIRR metadata GLM",
+  patient_metadata_glm  = "Patient metadata GLM"
+)
+
+COMPARATOR_BASE <- file.path(BASE, "comparator-output")
+
+# ── Helper ─────────────────────────────────────────────────────────────────────
+load_ensemble <- function(dir, model_label) {
+  bind_rows(
+    read_csv(file.path(dir, "unflipped/predictions/ensemble_predictions.csv"),
+             show_col_types = FALSE),
+    read_csv(file.path(dir, "flipped/predictions/ensemble_predictions.csv"),
+             show_col_types = FALSE)
+  ) %>%
+    dplyr::rename(
+      `prob_Multiple sclerosis` = ms_score,
+      Predicted                 = predicted_class,
+      Disease                   = true_label
+    ) %>%
+    mutate(model = model_label)
+}
+
+# ── LM models ─────────────────────────────────────────────────────────────────
+lm_preds <- imap(ENSEMBLE_DIRS, load_ensemble)
+
+# ── Comparator models ──────────────────────────────────────────────────────────
+comp_preds <- map(COMPARATOR_MODELS, function(m) {
+  load_ensemble(file.path(COMPARATOR_BASE, m), COMPARATOR_LABELS[[m]])
+})
+
+# ── Combine and filter ─────────────────────────────────────────────────────────
+all_preds <-
+  c(lm_preds, comp_preds) %>%
+  map(select, `prob_Multiple sclerosis`, Disease, Predicted, Author, Subject, model) %>%
+  reduce(bind_rows) %>%
+  mutate(
+    Predicted = if_else(Predicted == "Multiple sclerosis", "Multiple sclerosis", "Other"),
+    Disease   = if_else(Disease   == "Multiple sclerosis", "Multiple sclerosis", "Other")
+  ) %>%
+  # Remove known duplicate / confounded BioProjects
+  filter(Author != "PRJNA248475", Author != "PRJNA248411") %>%
+  # Remove MS twins
+  mutate(Disease = if_else(str_detect(Subject, "Twin(?:1|2|3|4)\\.2"), "MS Twin", Disease)) %>%
+  mutate(Disease = if_else(str_detect(Subject, "SCNI"),                "MS Twin", Disease)) %>%
+  filter(Disease != "MS Twin") %>%
+  mutate(
+    Disease   = factor(Disease),
+    Predicted = factor(Predicted, levels = levels(Disease))
+  )
+```
+
+```{r model-order}
+# Fixed model order: LM variants first (best to worst), then comparators
+LM_ORDER <- c(
+  "LM Exclusion Prec@5%",
+  "LM Baseline Prec@5%",
+  "LM Exclusion AUGC",
+  "LM Baseline AUGC"
+)
+
+COMP_ORDER <- c(
+  "Junction k-mer GLM",
+  "Junction k-mer RF",
+  "Sequence k-mer GLM",
+  "Sequence k-mer RF",
+  "Junction protein GLM",
+  "Junction protein RF",
+  "VDJ protein GLM",
+  "VDJ protein RF",
+  "AIRR metadata GLM",
+  "Patient metadata GLM"
+)
+
+MODEL_ORDER <- c(LM_ORDER, COMP_ORDER)
+
+MODEL_COLOURS <- c(
+  setNames(
+    viridis::viridis(length(LM_ORDER), option = "D", begin = 0.05, end = 0.9),
+    LM_ORDER
+  ),
+  setNames(rep("grey70", length(COMP_ORDER)), COMP_ORDER)
+)
+```
+
+```{r bootstrapped-auprc}
+# Bootstrapped AUPRC — 100 resamples per model
+set.seed(42)
+
+auprc_boots <-
+  all_preds %>%
+  group_by(model) %>%
+  group_modify(~ {
+    bootstraps(.x, times = 100) %>%
+      mutate(auprc = map_dbl(splits, ~ {
+        dat <- analysis(.x)
+        pr_auc_vec(dat$Disease, dat$`prob_Multiple sclerosis`)
+      }))
+  }) %>%
+  ungroup() %>%
+  mutate(model = factor(model, levels = rev(MODEL_ORDER)))
+
+ggplot(auprc_boots, aes(x = auprc, y = model, fill = model)) +
+  geom_boxplot(outliers = FALSE) +
+  scale_fill_manual(values = MODEL_COLOURS) +
+  theme_linedraw(base_size = 10) +
+  theme(
+    legend.position = "none",
+    panel.grid      = element_blank()
+  ) +
+  labs(x = "AUPRC (100 bootstrap resamples)", y = NULL,
+       title = "Precision@5% vs AUGC: AUPRC comparison")
+```
+
+```{r precision-at-top-k}
+# Precision in top X% by predicted MS score — 100 bootstrap resamples
+FRACS <- c(0.10, 0.05, 0.01, 0.001)
+
+precision_topk <- function(dat, frac) {
+  k   <- max(1L, round(nrow(dat) * frac))
+  top <- slice_max(dat, `prob_Multiple sclerosis`, n = k, with_ties = FALSE)
+  mean(top$Disease == "Multiple sclerosis")
+}
+
+topk_boots <-
+  all_preds %>%
+  group_by(model) %>%
+  group_modify(~ {
+    bootstraps(.x, times = 100) %>%
+      mutate(frac = list(FRACS)) %>%
+      unnest(frac) %>%
+      mutate(precision = map2_dbl(splits, frac, ~ {
+        precision_topk(analysis(.x), .y)
+      }))
+  }) %>%
+  ungroup() %>%
+  mutate(
+    pct   = paste0("Top ", frac * 100, "%"),
+    pct   = factor(pct, levels = paste0("Top ", FRACS * 100, "%")),
+    model = factor(model, levels = rev(MODEL_ORDER))
+  )
+
+ggplot(topk_boots, aes(x = precision, y = model, fill = model)) +
+  geom_boxplot(outliers = FALSE) +
+  facet_wrap(~pct, scales = "free_x", nrow = 1) +
+  scale_fill_manual(values = MODEL_COLOURS) +
+  scale_x_continuous(labels = scales::percent_format()) +
+  theme_linedraw(base_size = 10) +
+  theme(
+    legend.position  = "none",
+    panel.grid       = element_blank(),
+    axis.text.x      = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(x = "Precision in top X%", y = NULL,
+       title = "Precision@top-k: all models")
+```
+
+```{r precision-lm-only}
+# Zoomed view — LM variants only, for cleaner comparison
+topk_lm <-
+  topk_boots %>%
+  filter(model %in% LM_ORDER) %>%
+  mutate(model = factor(model, levels = rev(LM_ORDER)))
+
+ggplot(topk_lm, aes(x = precision, y = model, fill = model)) +
+  geom_boxplot(outliers = FALSE) +
+  facet_wrap(~pct, scales = "free_x", nrow = 1) +
+  scale_fill_manual(values = MODEL_COLOURS[LM_ORDER]) +
+  scale_x_continuous(labels = scales::percent_format()) +
+  theme_linedraw(base_size = 10) +
+  theme(
+    legend.position = "none",
+    panel.grid      = element_blank(),
+    axis.text.x     = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(x = "Precision in top X%", y = NULL,
+       title = "LM variants: Prec@5% objective vs AUGC objective")
+```

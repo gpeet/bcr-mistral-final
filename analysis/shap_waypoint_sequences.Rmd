@@ -1,0 +1,228 @@
+---
+title: "SHAP Waypoint → Sequence Mapping (Contrastive)"
+---
+
+## 1. Setup
+
+```{r setup, include=FALSE}
+source(here::here("R", "paths.R"))
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(patchwork)
+
+FIGURES_DIR   <- out_path("figures")
+INTERMEDIATES <- out_path("sequence-classifier/intermediates")
+BASE          <- out_path("sequence-classifier")
+
+# How many top SHAP waypoints to display (must be <= TOP_K in shap_nearest_sequences.py)
+TOP_K_DISPLAY <- 5
+
+dir.create(FIGURES_DIR,   showWarnings = FALSE, recursive = TRUE)
+dir.create(INTERMEDIATES, showWarnings = FALSE, recursive = TRUE)
+```
+
+## 2. Load SHAP Ranking & Identify Top Waypoint Features
+
+```{r load-shap-ranking}
+shap_ranking <- read_csv(file.path(INTERMEDIATES, "shap_feature_ranking.csv"),
+                         show_col_types = FALSE)
+
+# Contrastive waypoint features with signed direction. The patient model uses mean activations
+# only, so each waypoint appears once
+wp_features <- shap_ranking %>%
+  filter(str_detect(feature, "^CW\\d+_mean$")) %>%
+  mutate(wp_index = as.integer(str_extract(feature, "\\d+")))
+
+# Positive-direction waypoints: push toward MS, FDR-significant, ranked by significance
+pos_wp <- wp_features %>%
+  filter(signed_mean_shap > 0, fdr_p < 0.05) %>%
+  arrange(fdr_p) %>%
+  distinct(wp_index) %>%
+  head(5) %>%
+  pull(wp_index)
+
+# Negative-direction waypoints: push toward Other, FDR-significant, ranked by significance
+neg_wp <- wp_features %>%
+  filter(signed_mean_shap < 0, fdr_p < 0.05) %>%
+  arrange(fdr_p) %>%
+  distinct(wp_index) %>%
+  head(5) %>%
+  pull(wp_index)
+
+# Positive first then negative — order propagates to heatmap x-axis
+top_wp_indices <- c(pos_wp, neg_wp)
+
+cat("Positive-direction waypoints:", paste(pos_wp, collapse = ", "), "\n")
+cat("Negative-direction waypoints:", paste(neg_wp, collapse = ", "), "\n")
+cat("Combined order:", paste(top_wp_indices, collapse = ", "), "\n")
+```
+
+## 3. Load Pre-Computed Nearest Sequences
+
+Pre-computed by `shap_nearest_sequences.py` (GPU).
+
+```{r load-nearest-sequences}
+nearest_seqs <- read_csv(
+  file.path(INTERMEDIATES, "shap_nearest_training_sequences.csv"),
+  show_col_types = FALSE
+)
+
+cat("Loaded nearest sequences:", nrow(nearest_seqs), "rows\n")
+cat("Waypoints in file:", paste(sort(unique(nearest_seqs$wp_index)), collapse = ", "), "\n")
+cat("Sequences per waypoint:", nearest_seqs %>% count(wp_index) %>% pull(n) %>% unique(), "\n")
+
+# Filter to the TOP_K_DISPLAY waypoints
+nearest_seqs <- nearest_seqs %>%
+  filter(wp_index %in% top_wp_indices)
+
+cat("After TOP_K filter:", nrow(nearest_seqs), "rows across",
+    n_distinct(nearest_seqs$wp_index), "waypoints\n")
+
+# Truncate v_call to gene level (IGHV4-34*01 → IGHV4-34)
+nearest_seqs <- nearest_seqs %>%
+  mutate(v_gene_trunc = str_remove(v_call, "\\*.*"))
+```
+
+## 4. Rank Sequences Per Waypoint
+
+```{r rank-sequences}
+# Already ranked by distance (ascending) — rank 1 = closest to waypoint
+# Create a convenience long-format tibble for downstream plots
+top_seqs_per_wp <- nearest_seqs %>%
+  mutate(
+    wp_label = factor(paste0("CW", wp_index),
+                      levels = paste0("CW", top_wp_indices))
+  )
+
+cat("Top sequences per waypoint:\n")
+top_seqs_per_wp %>%
+  count(wp_index) %>%
+  print(n = 30)
+```
+
+## 5. V Gene Enrichment Per Waypoint
+
+```{r vgene-enrichment}
+# Background V gene frequencies from all training+test data
+# The nearest_seqs file contains the top-N per waypoint; for background we need
+# the full set. Use the weights CSVs.
+train_meta <- read_csv(data_path("classifier/classifier_data_igblast-train-weights.csv"),
+                       col_select = c("v_call"), show_col_types = FALSE)
+test_meta  <- read_csv(data_path("classifier/classifier_data_igblast-test-weights.csv"),
+                       col_select = c("v_call"), show_col_types = FALSE)
+all_meta <- bind_rows(train_meta, test_meta) %>%
+  mutate(v_gene_trunc = str_remove(v_call, "\\*.*"))
+
+bg_vgene <- all_meta %>%
+  count(v_gene_trunc, name = "bg_n") %>%
+  mutate(bg_total = sum(bg_n))
+rm(train_meta, test_meta, all_meta)
+
+cat("Background V gene distribution:", nrow(bg_vgene), "genes,",
+    first(bg_vgene$bg_total), "total sequences\n")
+
+# Per-waypoint enrichment (Fisher's exact test, one-sided greater)
+vgene_enrichment <- top_seqs_per_wp %>%
+  group_by(wp_index) %>%
+  group_modify(~ {
+    top_counts <- .x %>% count(v_gene_trunc, name = "top_n")
+    top_total  <- nrow(.x)
+
+    top_counts %>%
+      left_join(bg_vgene, by = "v_gene_trunc") %>%
+      mutate(
+        bg_n     = replace_na(bg_n, 0L),
+        bg_total = first(na.omit(bg_vgene$bg_total)),
+        p_value  = map2_dbl(top_n, bg_n, ~ {
+          fisher.test(
+            matrix(c(.x, top_total - .x, .y, first(bg_vgene$bg_total) - .y), nrow = 2),
+            alternative = "greater"
+          )$p.value
+        }),
+        fold_enrichment = (top_n / top_total) / (bg_n / first(bg_vgene$bg_total))
+      )
+  }) %>%
+  ungroup() %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH"))
+
+cat("Significant enrichments (p_adj < 0.05):\n")
+vgene_enrichment %>%
+  filter(p_adj < 0.05) %>%
+  arrange(p_adj) %>%
+  select(wp_index, v_gene_trunc, top_n, fold_enrichment, p_adj) %>%
+  print(n = 50)
+```
+
+## 6. Plots
+
+### 6a. Heatmap: Top Waypoints × Enriched V Genes
+
+```{r heatmap-enrichment, fig.width=5, fig.height=4}
+# V genes with at least one significant enrichment
+sig_vgenes <- vgene_enrichment %>%
+  filter(wp_index %in% top_wp_indices, p_adj < 0.001, fold_enrichment > 2) %>%
+  distinct(v_gene_trunc) %>%
+  pull(v_gene_trunc)
+
+if (length(sig_vgenes) == 0) {
+  # Fallback: top enriched V genes by fold enrichment
+  sig_vgenes <- vgene_enrichment %>%
+    filter(wp_index %in% top_wp_indices) %>%
+    group_by(v_gene_trunc) %>%
+    summarize(max_fe = max(fold_enrichment, na.rm = TRUE), .groups = "drop") %>%
+    slice_max(max_fe, n = 10) %>%
+    pull(v_gene_trunc)
+}
+
+heatmap_data <- vgene_enrichment %>%
+  filter(wp_index %in% top_wp_indices, v_gene_trunc %in% sig_vgenes) %>%
+  mutate(
+    sig_label  = if_else(p_adj < 0.05, "*", ""),
+    fe_display = if_else(is.infinite(fold_enrichment), NA_real_, fold_enrichment),
+    wp_label   = factor(paste0("CW", wp_index),
+                        levels = paste0("CW", top_wp_indices))
+  )
+
+p_heatmap <- ggplot(heatmap_data,
+       aes(x = wp_label, y = v_gene_trunc, fill = fe_display)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = sig_label), size = 5, colour = "black", nudge_y = -0.4) + 
+  scale_fill_viridis_c(
+    name      = "Fold\nenrichment",
+    na.value  = "grey80",
+    option    = "D",
+    direction = -1
+  ) +
+  theme_linedraw(base_size = 8) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid  = element_blank()
+  ) +
+  labs(
+    x        = "SHAP-ranked contrastive waypoint",
+    y        = "V gene",
+    title    = "V gene enrichment among nearest sequences per waypoint"
+  )
+p_heatmap
+ggsave(file.path(FIGURES_DIR, "fig4F_shap_waypoint_vgene_heatmap.svg"),
+       p_heatmap, width = 3.75, height = 3)
+```
+
+## 7. Export Summary Tables
+
+```{r export-tables}
+write_csv(vgene_enrichment,
+          file.path(INTERMEDIATES, "shap_waypoint_vgene_enrichment.csv"))
+write_csv(top_seqs_per_wp,
+          file.path(INTERMEDIATES, "shap_waypoint_top_sequences.csv"))
+
+cat("Exported:\n")
+cat("  - shap_waypoint_vgene_enrichment.csv:",
+    nrow(vgene_enrichment), "rows\n")
+cat("  - shap_waypoint_top_sequences.csv:",
+    nrow(top_seqs_per_wp), "rows\n")
+cat("\nInput CSVs (from shap_nearest_sequences.py):\n")
+cat("  - shap_nearest_training_sequences.csv\n")
+cat("\nTOP_K_DISPLAY:", TOP_K_DISPLAY, "waypoints shown\n")
+```

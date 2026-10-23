@@ -1,0 +1,227 @@
+---
+title: "Build pre/post treatment dataset"
+---
+
+```{r setup}
+source(here::here("R", "paths.R"))
+source(here::here("R", "metadata.R"))
+library(tidyverse)
+library(vroom)
+library(readxl)
+
+METADATA_XLS       <- data_path("metadata/2024-SRARunTable-MetadataCleaning.xlsx")
+# Master TRUST4 table built by `workflow/run.sh master-trust4`. This is the full table;
+# load-trust4 keeps only IGH rows, so it is equivalent to the IGH-only extract.
+TRUST4_CSV         <- data_path("sequences/master-trust4-dataset-sequence-unfiltered.csv")
+TRUST4_COLS        <- cols_only(sequence = "c", productive = "l", complete_vdj = "l", junction = "c",
+                                consensus_count = "d", v_call = "c", c_call = "c", file_name = "c")
+# Outputs go under BCRM_OUT/dataset/ (same relative paths) so a rebuild never overwrites the
+# released files in BCRM_DATA; BCRM_REBUILD_DATA=1 writes them into BCRM_DATA (as build_dataset.Rmd).
+build_path <- function(rel) {
+  p <- if (Sys.getenv("BCRM_REBUILD_DATA") == "1") data_path(rel) else out_path(file.path("dataset", rel))
+  dir.create(dirname(p), recursive = TRUE, showWarnings = FALSE)
+  p
+}
+# Folds: the ones build_dataset.Rmd just wrote, else the released ones in BCRM_DATA
+fold_path <- function(rel) if (file.exists(build_path(rel))) build_path(rel) else data_path(rel)
+TRAIN_WEIGHTS_CSV  <- fold_path("classifier/classifier_data_igblast-train-weights.csv")
+TEST_WEIGHTS_CSV   <- fold_path("classifier/classifier_data_igblast-test-weights.csv")
+cat("Folds from:", TRAIN_WEIGHTS_CSV, "and", TEST_WEIGHTS_CSV, "\n")
+OUT_TRAIN_CSV      <- build_path("classifier/treatment_sequences_train.csv")
+OUT_TEST_CSV       <- build_path("classifier/treatment_sequences_test.csv")
+MAX_SEQS_PER_GROUP <- 20000L
+
+# Treatments that represent the pre-treatment baseline timepoint
+BASELINE_TX <- c("Pretreatment", "Treatment naive", "No treatment",
+                 "No recent treatment")
+```
+
+```{r load-metadata}
+metadata <- read_metadata(METADATA_XLS) %>%
+  select(Run, Filename, BioProject, create_date,
+         Tissue, `Cell Type`, Age, Sex, DonorID,
+         Disease, `Disease Class`, Treatment,
+         `Patient State`, EDSS, `Years disease`) %>%
+  mutate(Subject = paste(Age, Sex, DonorID))
+
+# Donors who have at least one baseline run AND at least one post-treatment run.
+# Treatment = NA is treated as baseline when the same subject also has
+# labeled post-treatment runs (handles PRJNA906479 Cladribine where
+# the true pretreatment timepoint has Treatment = NA in metadata).
+paired_donors <- metadata %>%
+  group_by(BioProject, Subject) %>%
+  summarize(
+    has_baseline = any(Treatment %in% BASELINE_TX | is.na(Treatment)),
+    has_post     = any(!is.na(Treatment) & !Treatment %in% BASELINE_TX),
+    n_runs       = n(),
+    treatments   = paste(sort(unique(na.omit(Treatment))), collapse = " | "),
+    .groups      = "drop"
+  ) %>%
+  filter(has_baseline & has_post)
+
+cat(sprintf(
+  "Found %d donors with pre/post data across %d BioProjects\n",
+  nrow(paired_donors),
+  n_distinct(paired_donors$BioProject)
+))
+```
+
+```{r paired-donor-summary}
+# Diagnostic summary: BioProject-level overview of paired treatment data
+paired_meta_diag <- metadata %>%
+  semi_join(paired_donors, by = c("BioProject", "Subject"))
+
+diag_summary <- paired_meta_diag %>%
+  group_by(BioProject) %>%
+  summarize(
+    n_paired_subjects = n_distinct(Subject),
+    tissues           = paste(sort(unique(Tissue)), collapse = ", "),
+    drugs             = paste(sort(unique(
+      Treatment[!is.na(Treatment) & !Treatment %in% BASELINE_TX]
+    )), collapse = ", "),
+    .groups = "drop"
+  )
+
+cat("=== Paired Treatment Dataset Summary ===\n\n")
+diag_summary %>% print(n = 30, width = Inf)
+cat(sprintf(
+  "\nTotal paired subjects: %d across %d BioProjects\n",
+  sum(diag_summary$n_paired_subjects),
+  nrow(diag_summary)
+))
+
+# Per-subject detail
+paired_donors %>%
+  select(BioProject, Subject, n_runs, treatments) %>%
+  arrange(BioProject, Subject) %>%
+  print(n = 80)
+```
+
+```{r load-trust4}
+cat("Reading master TRUST4 sequence CSV...\n")
+trust4 <- vroom(TRUST4_CSV, col_types = TRUST4_COLS) %>%
+  filter(str_starts(v_call, "IGH")) %>%
+  filter(productive == TRUE, complete_vdj == TRUE) %>%
+  filter(!is.na(sequence), !is.na(junction)) %>%
+  mutate(SRA = str_extract(file_name, "(SRR|ERR)[0-9]+"))
+
+cat(sprintf("  %s IGH productive complete_vdj sequences\n", scales::comma(nrow(trust4))))
+
+# Metadata for only the paired donors
+paired_meta <- metadata %>%
+  semi_join(paired_donors, by = c("BioProject", "Subject"))
+
+cat(sprintf("  %d runs in paired metadata\n", nrow(paired_meta)))
+```
+
+```{r join-sequences}
+# SRA data: join via SRA run accession
+seqs_sra <- trust4 %>%
+  filter(!is.na(SRA)) %>%
+  inner_join(paired_meta, by = c("SRA" = "Run"))
+
+cat(sprintf("  SRA join: %s sequences\n", scales::comma(nrow(seqs_sra))))
+
+# Bennett data: join via Filename column
+bennett_meta <- paired_meta %>% filter(!is.na(Filename)) %>% distinct(Filename, .keep_all = T)
+
+# Guard: Filename must be unique in metadata to prevent row duplication
+stopifnot(!anyDuplicated(bennett_meta$Filename))
+
+seqs_bennett <- trust4 %>%
+  inner_join(bennett_meta, by = c("file_name" = "Filename")) %>%
+  filter(Tissue %in% c("Blood", "CSF"))   # drop Spleen etc.
+
+cat(sprintf("  Bennett join: %s sequences (%s Blood, %s CSF)\n",
+            scales::comma(nrow(seqs_bennett)),
+            scales::comma(sum(seqs_bennett$Tissue == "Blood")),
+            scales::comma(sum(seqs_bennett$Tissue == "CSF"))))
+
+seqs <- bind_rows(seqs_sra, seqs_bennett) %>%
+  mutate(timepoint = case_when(
+    is.na(Treatment)           ~ "baseline",
+    Treatment %in% BASELINE_TX ~ "baseline",
+    TRUE                       ~ "post"
+  ))
+
+cat(sprintf("  Combined: %s sequences\n", scales::comma(nrow(seqs))))
+
+seqs %>%
+  count(timepoint, BioProject, sort = TRUE) %>%
+  print(n = 30)
+
+
+```
+
+```{r sample-and-write}
+set.seed(8675309)
+
+out <- seqs %>%
+  group_by(BioProject, Subject, Run, Treatment, Tissue, `Cell Type`) %>%
+  slice_sample(n = MAX_SEQS_PER_GROUP, replace = FALSE) %>%
+  ungroup() %>%
+  rename(
+    Author  = BioProject,
+    BSource = Tissue,
+    BType   = `Cell Type`,
+    Isotype = c_call
+  ) %>%
+  mutate(Year = year(create_date)) %>%
+  select(
+    Author, Year, Disease, Subject, Age, Sex, DonorID, BSource, BType, Isotype,
+    v_call, sequence, junction, consensus_count,
+    Run, Treatment, timepoint,
+    EDSS, `Years disease`, `Disease Class`, `Patient State`
+  )
+
+# Determine fold membership from the original train/test weights CSVs
+train_authors <- vroom(TRAIN_WEIGHTS_CSV, col_select = Author) %>%
+  distinct() %>% pull(Author)
+test_authors  <- vroom(TEST_WEIGHTS_CSV,  col_select = Author) %>%
+  distinct() %>% pull(Author)
+
+# Guard: BioProjects must be exclusive to one fold
+stopifnot(length(intersect(train_authors, test_authors)) == 0)
+
+# Guard: every treatment BioProject must be in a fold
+unknown <- setdiff(unique(out$Author), c(train_authors, test_authors))
+if (length(unknown) > 0) {
+  stop(paste("BioProjects not found in either fold:", paste(unknown, collapse = ", ")))
+}
+
+out_train <- out %>% filter(Author %in% train_authors)
+out_test  <- out %>% filter(Author %in% test_authors)
+
+cat(sprintf("Train fold: %s rows (%d BioProjects) -> %s\n",
+            scales::comma(nrow(out_train)),
+            n_distinct(out_train$Author), OUT_TRAIN_CSV))
+cat(sprintf("Test fold:  %s rows (%d BioProjects) -> %s\n",
+            scales::comma(nrow(out_test)),
+            n_distinct(out_test$Author), OUT_TEST_CSV))
+
+write_csv(out_train, OUT_TRAIN_CSV)
+write_csv(out_test,  OUT_TEST_CSV)
+```
+
+```{r verify}
+bind_rows(
+  out_train %>% mutate(fold = "train"),
+  out_test  %>% mutate(fold = "test")
+) %>%
+  count(fold, Author, timepoint) %>%
+  pivot_wider(names_from = timepoint, values_from = n, values_fill = 0) %>%
+  arrange(fold, Author) %>%
+  print(n = 60)
+
+cat("\nPaired subjects per fold:\n")
+bind_rows(
+  out_train %>% mutate(fold = "train"),
+  out_test  %>% mutate(fold = "test")
+) %>%
+  count(fold, Author, Subject, timepoint) %>%
+  group_by(fold, Author, Subject) %>%
+  filter(any(timepoint == "baseline") & any(timepoint == "post")) %>%
+  ungroup() %>%
+  count(fold, Author, name = "n_paired") %>%
+  print(n = 30)
+```

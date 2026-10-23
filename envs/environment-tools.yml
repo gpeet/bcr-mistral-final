@@ -1,0 +1,13 @@
+# Command-line tools for rebuilding the dataset (SRA download, OPIG download, master tables).
+# TRUST4 itself is installed separately (https://github.com/liulab-dfci/TRUST4); set TRUST4_HOME.
+name: bcrm-tools
+channels:
+  - conda-forge
+  - bioconda
+dependencies:              # versions tested on Alpine, 2026-10
+  - sra-tools=3.4.1
+  - fastp=1.4.0
+  - csvtk=0.38.0
+  - parallel
+  - wget
+  - perl

@@ -1,0 +1,159 @@
+---
+title: "V gene enrichment by tissue (Fig. 1F, 1G)"
+---
+
+```{r}
+source(here::here("R", "paths.R"))
+source(here::here("R", "exclusions.R"))
+library(tidyverse)
+library(readxl)
+library(vroom)
+library(ggrepel)
+```
+
+```{r Read in dataset}
+# Quality-filtered TRUST4 IGH sequences (built by dataset/08_preliminary_trust4.R)
+filtering <- 
+  read_csv(data_path("sequences/preliminary-trust4-quality-sequences.csv")) %>%
+  filter(!is.na(BioProject) & (!is.na(DonorID) | !is.na(Age) | !is.na(Sex) | !is.na(Disease))) %>%
+  drop_duplicate_repertoires("BioProject", "DonorID")   # duplicated repertoires (R/exclusions.R)
+```
+
+```{r V gene enrichment test - MS v Healthy}
+
+# MS vs control blood: the Results text reports V genes enriched in MS blood (no figure panel)
+filtering %>%
+  filter(Tissue == 'Blood') %>%
+  mutate(Disease = fct_lump(Disease, n = 1)) %>%
+  mutate(v_call = str_replace(v_call, "\\*.*", "")) %>%
+  group_by(BioProject, Disease, Age, Sex, DonorID) %>%
+  filter(!is.na(BioProject)) %>%
+  filter(n() > 100) %>%
+  group_by(BioProject, Disease, Age, Sex, DonorID, v_call) %>%
+  summarize(v_gene_count = n()) %>%
+  group_by(BioProject, Disease, Age, Sex, DonorID) %>%
+  mutate(v_gene_prop = v_gene_count / sum(v_gene_count)) %>%
+  ungroup() %>%
+  select(v_call, Disease, v_gene_prop) %>%
+  group_by(v_call) %>%
+  filter(sum(Disease == 'Multiple sclerosis') > 5 && sum(Disease == 'Other') > 5) %>%
+  summarize(p_value = wilcox.test(v_gene_prop ~ as_factor(Disease))$p.value, 
+            statistic = wilcox.test(v_gene_prop ~ as_factor(Disease))$statistic) %>%
+  ungroup() %>%
+  mutate(p_value_adj = p.adjust(p_value, method = 'fdr', n = length(p_value))) %>%
+  arrange(p_value_adj) -> significant_v_genes
+
+head(significant_v_genes, n = 20)
+```
+
+```{r V gene frequency helpers}
+# Per-repertoire V-gene frequencies in MS repertoires (> 100 sequences) from `tissue` and blood.
+# A repertoire is one BioProject / Tissue / Age / Sex / DonorID combination. The test and the
+# scatter plot of each panel use the same repertoires.
+vgene_props <- function(tissue, sra_only) {
+  filtering %>%
+    { if (sra_only) filter(., !str_starts(BioProject, 'Bennett')) else . } %>%
+    filter(Disease == 'Multiple sclerosis', Tissue %in% c(tissue, 'Blood')) %>%
+    mutate(v_call = str_replace(v_call, "\\*.*", "")) %>%
+    group_by(BioProject, Tissue, Age, Sex, DonorID) %>%
+    filter(n() > 100) %>%
+    group_by(BioProject, Tissue, Age, Sex, DonorID, v_call) %>%
+    summarize(v_gene_count = n(), .groups = "drop_last") %>%
+    mutate(v_gene_prop = v_gene_count / sum(v_gene_count)) %>%
+    group_by(v_call) %>%
+    filter(sum(Tissue == tissue) > 2, sum(Tissue == 'Blood') > 2) %>%
+    ungroup()
+}
+
+# Wilcoxon rank-sum test per V gene, `tissue` vs blood. The direction is fixed: estimate is the
+# location shift tissue minus blood, so > 0 means higher in `tissue`. P-values are FDR-adjusted
+# over every gene tested, before the enriched genes are selected.
+vgene_tests <- function(props, tissue) {
+  props %>%
+    group_by(v_call) %>%
+    summarize(
+      n_tissue = sum(Tissue == tissue),
+      n_blood  = sum(Tissue == 'Blood'),
+      test     = list(wilcox.test(v_gene_prop[Tissue == tissue], v_gene_prop[Tissue == 'Blood'],
+                                  conf.int = TRUE)),
+      .groups = "drop") %>%
+    mutate(p_value  = map_dbl(test, "p.value"),
+           estimate = map_dbl(test, "estimate")) %>%
+    select(-test) %>%
+    mutate(p_value_adj = p.adjust(p_value, method = 'fdr'),
+           higher_in   = if_else(estimate > 0, tissue, 'Blood')) %>%
+    arrange(p_value_adj)
+}
+
+# Mean frequency per tissue, one row per V gene (the scatter plot)
+vgene_means <- function(props) {
+  props %>%
+    group_by(Tissue, v_call) %>%
+    summarize(v_gene_prop_mean = mean(v_gene_prop), .groups = "drop") %>%
+    pivot_wider(names_from = 'Tissue', values_from = 'v_gene_prop_mean')
+}
+```
+
+```{r Significant V genes - MS CSF v MS Blood}
+# SRA studies only, as in the legend (in-house Bennett repertoires excluded)
+props_csf <- vgene_props('CSF', sra_only = TRUE)
+tests_csf <- vgene_tests(props_csf, 'CSF')
+cat(sprintf("Fig. 1F: %d repertoires (%d CSF), %d V genes tested\n",
+            n_distinct(select(props_csf, BioProject, Tissue, Age, Sex, DonorID)),
+            n_distinct(select(filter(props_csf, Tissue == 'CSF'), BioProject, Age, Sex, DonorID)),
+            nrow(tests_csf)))
+write_csv(tests_csf, out_path('figures/fig1F_vgene_tests.csv'))
+
+# Genes higher in CSF, most significant first; the top 5 are labelled
+significant_v_genes <- filter(tests_csf, estimate > 0)
+significant_v_genes
+```
+
+```{r}
+catch <- vgene_means(props_csf)
+
+catch %>%
+  ggplot(aes(x = Blood, y = CSF)) +
+  geom_point() +
+  geom_label_repel(data = filter(catch, v_call %in% slice_min(significant_v_genes, order_by = p_value_adj, n = 5, with_ties = F)$v_call), aes(label = v_call), nudge_x = -1, seed = 42) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  scale_y_log10(limits = c(10^-5,1)) +
+  scale_x_log10(limits = c(10^-5,1)) +
+  coord_fixed(ratio = 1) +
+  theme_linedraw(base_size = 10) +
+  theme(panel.grid = element_blank()) +
+  labs(x = 'Frequency in MS Patient Blood', y = 'Frequency in MS Patient CSF')
+
+ggsave(out_path('figures/fig1F_vgene_enrichment_csf_v_blood.svg'), width = 2.5, height = 2.5)
+```
+
+```{r Significant V genes - MS Brain v MS Blood}
+props_brain <- vgene_props('Brain', sra_only = FALSE)
+tests_brain <- vgene_tests(props_brain, 'Brain')
+cat(sprintf("Fig. 1G: %d repertoires (%d brain), %d V genes tested\n",
+            n_distinct(select(props_brain, BioProject, Tissue, Age, Sex, DonorID)),
+            n_distinct(select(filter(props_brain, Tissue == 'Brain'), BioProject, Age, Sex, DonorID)),
+            nrow(tests_brain)))
+write_csv(tests_brain, out_path('figures/fig1G_vgene_tests.csv'))
+
+significant_v_genes <- filter(tests_brain, estimate > 0)
+significant_v_genes
+```
+
+```{r}
+catch <- vgene_means(props_brain)
+
+catch %>%
+  ggplot(aes(x = Blood, y = Brain)) +
+  geom_point() +
+  geom_label_repel(data = filter(catch, v_call %in% slice_min(significant_v_genes, order_by = p_value_adj, n = 5, with_ties = F)$v_call), aes(label = v_call), nudge_x = -1, seed = 42) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  scale_y_log10(limits = c(10^-5,1)) +
+  scale_x_log10(limits = c(10^-5,1)) +
+  coord_fixed(ratio = 1) +
+  theme_classic(base_size = 10) +
+  theme(panel.grid = element_blank()) +
+  labs(x = 'Frequency in MS Blood Samples', y = 'Frequency in MS Brain Samples')
+
+ggsave(out_path('figures/fig1G_vgene_enrichment_brain_v_blood.svg'), width = 2.5, height = 2.5)
+```

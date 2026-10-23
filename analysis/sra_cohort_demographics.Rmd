@@ -1,0 +1,115 @@
+---
+title: "SRA cohort demographics (Fig. 1A-D)"
+output: html_notebook
+---
+
+Ported from the original Fig1-panels notebook. Panels 1A and 1B were made from one
+alluvial chunk by toggling commented-out lines; here each is its own chunk.
+
+```{r setup}
+source(here::here("R", "paths.R"))
+source(here::here("R", "metadata.R"))
+library(tidyverse)
+library(ggalluvial)
+
+FIGURES_DIR <- out_path("figures")
+dir.create(FIGURES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+newDataset <- read_metadata()
+
+# One row per patient, with study, demographics and (latest) tissue
+patients <- newDataset %>%
+  group_by(BioProject, Age, Sex, Disease, DonorID, `Disease Class`) %>%
+  summarize(count = n(), Tissue = max(Tissue), .groups = "drop") %>%
+  mutate(Disease = fct_lump_n(Disease, n = 1, other_level = 'Study controls')) %>%
+  mutate(Tissue = fct_lump_n(Tissue, n = 3)) %>%
+  mutate(Sex = fct_explicit_na(Sex, na_level = "Missing")) %>%
+  mutate(Sex = fct_collapse(Sex, Missing = c("Missing", "UKN"))) %>%   # unknown sex shown as Missing, as in the paper
+  mutate(
+    Age = cut(
+          Age,
+          breaks = seq(0, 100, by = 15),
+          include.lowest = T,
+          right = F,
+          labels = c("0-15", "15-30", "30-45", "45-60", "60-75", "75-90"),
+          ordered_result = T),
+    Age = fct_rev(Age),
+    Age = fct_explicit_na(Age, na_level = "Missing"),
+    Age = fct_relevel(Age, "Missing", after = Inf)
+  )
+
+alluvial_plot <- function(df, second_axis) {
+  df %>%
+    group_by({{ second_axis }}, Tissue, Disease) %>%
+    summarise(Count = n(), .groups = "drop") %>%
+    ggplot(aes(y = Count, axis1 = Disease, axis2 = {{ second_axis }})) +
+    geom_alluvium(width = 1/6, aes(fill = Tissue)) +
+    geom_stratum(width = 1/6, fill = "black", color = "grey") +
+    geom_label(stat = "stratum", aes(label = after_stat(stratum))) +
+    scale_x_discrete(limits = c("Tissue", "Sex"), expand = c(0,0)) +
+    theme_light() +
+    theme(aspect.ratio = 2,
+          panel.grid = element_blank(),
+          axis.text.x = element_blank()) +
+    scale_y_continuous(expand = c(0,0)) +
+    scale_fill_viridis_d(option = 'turbo')
+}
+```
+
+```{r Fig 1A: disease by sex and tissue}
+alluvial_plot(patients, Sex)
+ggsave(file.path(FIGURES_DIR, "fig1A_demographics_disease_sex.svg"))
+```
+
+```{r Fig 1B: disease by age and tissue}
+alluvial_plot(patients, Age)
+ggsave(file.path(FIGURES_DIR, "fig1B_demographics_disease_age.svg"))
+```
+
+```{r Fig 1C: patient age distribution}
+newDataset %>%
+  group_by(BioProject, Age, Sex, Disease, DonorID, `Disease Class`) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  mutate(Disease = fct_lump_n(Disease, n = 1, other_level = 'Study controls')) %>%
+  ggplot(aes(x = Age, fill = Disease)) +
+  geom_density(alpha = 0.5, adjust = 2) +
+  theme_classic(base_size = 14) +
+  theme(aspect.ratio = 0.5) +
+  scale_fill_viridis_d(option = 'rocket') +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0))
+
+ggsave(file.path(FIGURES_DIR, "fig1C_age_density.svg"))
+```
+
+```{r Fig 1D: publication year by study}
+newDataset %>%
+  group_by(BioProject) %>%
+  summarise(`Publication Year` = max(year(ReleaseDate))) %>%
+  ggplot(aes(x = `Publication Year`)) +
+  geom_histogram(binwidth = 1) +
+  theme_classic(base_size = 24) +
+  theme(aspect.ratio = 0.5) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_x_continuous(expand = c(0,0), breaks = c(2014,2016,2018,2020,2022,2024)) +
+  geom_vline(xintercept = 2022, color = 'red', size = 2) +
+  labs(y = 'Studies')
+
+ggsave(file.path(FIGURES_DIR, "fig1D_publication_year_studies.svg"))
+```
+
+```{r Fig 1D: publication year by patient}
+newDataset %>%
+  group_by(BioProject, Age, Sex, Disease, DonorID, `Disease Class`) %>%
+  summarise(`Publication Year` = max(year(ReleaseDate)), .groups = "drop") %>%
+  ggplot(aes(x = `Publication Year`)) +
+  geom_histogram(binwidth = 1) +
+  theme_classic(base_size = 24) +
+  theme(aspect.ratio = 0.5) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_x_continuous(expand = c(0,0), breaks = c(2014,2016,2018,2020,2022,2024)) +
+  geom_vline(xintercept = 2022, color = 'red', size = 2) +
+  labs(y = 'Patients')
+
+ggsave(file.path(FIGURES_DIR, "fig1D_publication_year_patients.svg"))
+```

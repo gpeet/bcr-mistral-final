@@ -1,0 +1,24 @@
+{
+  "fold": "fold1",
+  "best_trial": 155,
+  "best_augc": 0.09176333745320638,
+  "params": {
+    "n_layers": 3,
+    "first_width": 412,
+    "width_decay": 0.38049646249606633,
+    "dropout": 0.2542921398250845,
+    "input_dropout": 0.2911870962598679,
+    "lr": 3.237629698274639e-05,
+    "weight_decay": 0.001269205312590693,
+    "label_smoothing": 0.09522928759051018,
+    "flip_rate_init": 0.07636297692092602,
+    "flip_rate_final": 0.9992128366943738,
+    "flip_rate_delta": 0.0006201955655461025
+  },
+  "n_params": 494998,
+  "hidden_dims": [
+    412,
+    152,
+    56
+  ]
+}

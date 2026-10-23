@@ -1,0 +1,10 @@
+{
+  "best_trial": 279,
+  "best_val_mse": 0.09019620532231756,
+  "model": "WaypointAutoencoder_softmax_decoupled_decoder",
+  "params": {
+    "temperature": 1.6993798752658915,
+    "lr": 0.04826976343744764,
+    "n_seq_per_rep": 850
+  }
+}

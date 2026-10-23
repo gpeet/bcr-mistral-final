@@ -1,0 +1,820 @@
+---
+title: "Patient-Level Classification — Figure 4"
+---
+
+```{r setup, include=FALSE}
+source(here::here("R", "paths.R"))
+source(here::here("R", "exclusions.R"))
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(tidymodels)
+library(xgboost)
+library(SHAPforxgboost)
+library(vip)
+library(pROC)
+library(patchwork)
+library(limma)
+
+FIGURES_DIR      <- out_path("figures")
+INTERMEDIATES_DIR <- out_path("sequence-classifier/intermediates")
+
+PATIENT_FEATURES_CSV         <- out_path("sequence-classifier/waypoints-final/patient_features.csv")
+PATIENT_FEATURES_CONTRASTIVE <- out_path("sequence-classifier/waypoints-contrastive-final/patient_features_contrastive.csv")
+PATIENT_FEATURES_GRAPH       <- out_path("sequence-classifier/graph-final/patient_features_graph.csv")
+
+# Batch correction of the waypoint features for tissue source (BSource), set by BCRM_BATCH_CORRECTION:
+#   "all"  (default, as published): limma::removeBatchEffect on all patients before cross-validation;
+#          its design includes the MS/Other labels, so held-out patients' labels inform their correction
+#   "fold": the same correction estimated on each outer training fold only and applied to its test fold
+#   "none": no correction
+# All three keep the same patients (singleton/NA tissue sources are dropped in every mode).
+# The other modes write to their own subfolders, so they never replace the files the Fig. 4F notebooks read.
+# In those modes the SHAP model (section 11) is fitted on uncorrected features.
+BATCH_MODE <- Sys.getenv("BCRM_BATCH_CORRECTION", "all")
+stopifnot(BATCH_MODE %in% c("all", "fold", "none"))
+USE_BATCH_CORRECTION <- TRUE
+if (BATCH_MODE != "all") {
+  FIGURES_DIR       <- file.path(FIGURES_DIR, paste0("batch-", BATCH_MODE))
+  INTERMEDIATES_DIR <- file.path(INTERMEDIATES_DIR, paste0("batch-", BATCH_MODE))
+}
+dir.create(FIGURES_DIR,      showWarnings = FALSE, recursive = TRUE)
+dir.create(INTERMEDIATES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# Which activation statistics to keep: "mean", "max", or "both"
+ACTIVATION_MODE <- "mean"
+
+# --- Model & evaluation configuration ---
+
+# Which experiments to show in comparison plots (NULL = show all)
+ACTIVE_MODELS <- NULL
+
+# Which experiment to use for SHAP analysis (must match a name in experiments list)
+SHAP_MODEL <- "Contrastive WP only"
+
+# Which experiment to use for threshold sweep / high-depth filtering
+THRESHOLD_MODEL <- "Contrastive WP only"
+
+# Inner folds for nested CV hyperparameter tuning
+N_INNER_FOLDS <- 4
+
+# Number of study-level bootstrap replicates for AUC boxplots
+N_BOOT <- 100
+
+# Number of times to repeat 5-fold CV (>1 stabilizes estimates)
+N_CV_REPEATS <- 1
+
+# --- Viridis palette helper ---
+make_viridis_palette <- function(nms) {
+  cols <- viridis::viridis(length(nms), option = "D", begin = 0.1, end = 0.9)
+  setNames(cols, nms)
+}
+```
+
+## 1. Data Loading & Preprocessing
+
+```{r load-data}
+df <- read_csv(PATIENT_FEATURES_CSV, show_col_types = FALSE)
+cat("BSource distribution:\n")
+print(table(df$BSource, useNA = "ifany"))
+
+# Join contrastive waypoint features (CW* columns)
+if (file.exists(PATIENT_FEATURES_CONTRASTIVE)) {
+  df_cw <- read_csv(PATIENT_FEATURES_CONTRASTIVE, show_col_types = FALSE) %>%
+    select(Author, Subject, BSource, starts_with("CW"))
+  df <- left_join(df, df_cw, by = c("Author", "Subject", "BSource"))
+  cat("Joined", sum(grepl("^CW", names(df))), "contrastive waypoint features\n")
+} else {
+  cat("Contrastive features not found:", PATIENT_FEATURES_CONTRASTIVE, "\n")
+}
+
+# Join graph embedding features (G* columns)
+if (file.exists(PATIENT_FEATURES_GRAPH)) {
+  df_graph <- read_csv(PATIENT_FEATURES_GRAPH, show_col_types = FALSE) %>%
+    select(Author, Subject, BSource, starts_with("G"))
+  df <- left_join(df, df_graph, by = c("Author", "Subject", "BSource"))
+  cat("Joined", sum(grepl("^G\\d+", names(df))), "graph embedding features\n")
+} else {
+  cat("Graph features not found:", PATIENT_FEATURES_GRAPH, "\n")
+}
+
+# Filter activation columns based on ACTIVATION_MODE
+if (ACTIVATION_MODE == "mean") {
+  drop_cols <- grep("^(C?W|G)\\d+_max$", names(df), value = TRUE)
+  df <- df %>% select(-all_of(drop_cols))
+  cat("Keeping mean activations only; dropped", length(drop_cols), "_max columns\n")
+} else if (ACTIVATION_MODE == "max") {
+  drop_cols <- grep("^(C?W|G)\\d+_mean$", names(df), value = TRUE)
+  df <- df %>% select(-all_of(drop_cols))
+  cat("Keeping max activations only; dropped", length(drop_cols), "_mean columns\n")
+} else {
+  cat("Keeping both mean and max activations\n")
+}
+
+# Binarize for classification; keep original 4-class label for confusion matrix
+df <- df %>%
+  mutate(
+    Disease_binary = factor(
+      if_else(Disease == "Multiple sclerosis", "MS", "Other"),
+      levels = c("MS", "Other")
+    ),
+    Disease = factor(Disease)
+  ) %>%
+  filter(!is.na(ms_score_median)) %>%   # drop patients without predictions
+  # Remove known duplicate / confounded BioProjects
+  filter(Author != "PRJNA866296") %>%  # confounded with larger study (same patients)
+  drop_duplicate_repertoires("Author", "Subject") %>%   # duplicated repertoires (R/exclusions.R)
+  # Merge mislabeled / same-lab OPIG study names into a single CV fold group
+  mutate(Author = case_match(Author,
+    "Galson_2015 et al., 2015" ~ "Galson et al., 2015",  # mislabeled duplicate
+    "Soto et al., 2019"        ~ "Soto et al., 2016",    # same lab, group together
+    "Zhu et al., 2013"         ~ "Zhu et al., 2012",     # same lab, group together
+    "Zhou et al., 2015"        ~ "Zhou et al., 2013",    # same lab, group together
+    "BennettNMO"               ~ "BennettMS",            # same lab, group together
+    .default = Author
+  ))
+
+# Class imbalance for XGBoost scale_pos_weight
+# Disease_binary levels: c("MS", "Other") → xgboost maps MS=0 (negative), Other=1 (positive)
+# scale_pos_weight = sum(negative) / sum(positive)
+n_ms       <- sum(df$Disease_binary == "MS")
+n_other    <- sum(df$Disease_binary == "Other")
+pos_weight <- n_ms / n_other
+
+cat("Total Patients:", nrow(df), "\n")
+cat("MS:", n_ms, "| Other:", n_other, "\n")
+cat("Recommended scale_pos_weight:", round(pos_weight, 2), "\n")
+cat("n_seqs: min =", min(df$n_seqs), " median =", median(df$n_seqs),
+    " max =", max(df$n_seqs), "\n")
+```
+
+## 2. Optional Batch Correction
+Apply `limma::removeBatchEffect` on embedding features by BSource (tissue origin),
+preserving the Disease signal. W*, CW*, and G* columns are corrected — prediction-derived
+features (ms_score_* features) are already fold-aware and don't need correction.
+
+```{r batch-correction}
+if (USE_BATCH_CORRECTION) {
+  # ── Inspect BSource levels ──────────────────────────────────────
+  cat("BSource levels before standardization:\n")
+  print(table(df$BSource, useNA = "ifany"))
+
+  # Collapse the recorded tissues into the groups used as the batch variable
+  df$BSource <- case_match(df$BSource,
+    "PBMC"   ~ "Blood",
+    "LeukoPak" ~ "Blood",
+    "Bone-Marrow" ~ "Other",
+    "Cervical-Lymph-Node" ~ "Brain",
+    "Colon" ~ "Other",
+    "Cord-Blood-Cells" ~ "Blood",
+    "Ileum" ~ "Other",
+    "Jejunum" ~ "Other",
+    "Lung" ~ "Other",
+    "Lymph" ~ "Other",
+    "Mesenteric-Lymph-Node" ~ "Other",
+    "Spleen" ~ "Other",
+    .default = df$BSource
+  )
+  cat("BSource levels after standardization:\n")
+  print(table(df$BSource, useNA = "ifany"))
+
+  # Drop samples with NA or singleton BSource levels (can't batch-correct)
+  bsource_counts <- table(df$BSource)
+  valid_bsources <- names(bsource_counts[bsource_counts >= 2])
+  n_before <- nrow(df)
+  df <- df %>% filter(BSource %in% valid_bsources)
+  cat(sprintf("Dropped %d samples with singleton/NA BSource levels (%d → %d)\n",
+              n_before - nrow(df), n_before, nrow(df)))
+
+  emb_cols <- grep("^(C?W|G)\\d+_(mean|max)$", names(df), value = TRUE)
+  if (BATCH_MODE == "all") {
+    emb_mat  <- t(as.matrix(df[, emb_cols]))  # limma expects features × samples
+
+    # Protect Disease signal while removing BSource batch effects
+    design  <- model.matrix(~ Disease_binary, data = df)
+    emb_corrected <- removeBatchEffect(emb_mat, batch = df$BSource, design = design)
+
+    df[, emb_cols] <- t(emb_corrected)
+    cat("Batch correction applied to", length(emb_cols), "embedding features by BSource\n")
+  } else cat("Batch correction mode:", BATCH_MODE, "\n")
+} else {
+  cat("Batch correction: OFF (set USE_BATCH_CORRECTION <- TRUE to enable)\n")
+}
+```
+
+## 3. Cross Validation Setup
+
+```{r cv-setup}
+set.seed(42)
+all_splits <- list()
+all_ids    <- character()
+for (rep in seq_len(N_CV_REPEATS)) {
+  folds_rep <- group_vfold_cv(df, group = "Author", v = 5)
+  for (j in seq_along(folds_rep$splits)) {
+    all_splits <- c(all_splits, list(folds_rep$splits[[j]]))
+    all_ids    <- c(all_ids, paste0("Rep", rep, "_Fold", j))
+  }
+}
+cv_folds <- manual_rset(all_splits, all_ids)
+cat(sprintf("CV: %d repeats × 5 folds = %d total splits\n", N_CV_REPEATS, nrow(cv_folds)))
+```
+
+## 4. Naive Baseline Predictions (ms_score_90pct)
+Build a "predictions" frame for the naive classifier — just uses `ms_score_90pct`
+directly as P(MS). No model is trained, so no train/test leakage; the score is a
+fixed per-patient feature from the sequence classifier.
+
+```{r naive-baseline-preds}
+naive_preds <- df %>%
+  transmute(
+    Author, Subject, Disease_binary, Disease, BSource, n_seqs,
+    .pred_MS    = ms_score_90pct,
+    .pred_Other = 1 - ms_score_90pct,
+    .pred_class = factor(if_else(ms_score_90pct >= 0.5, "MS", "Other"),
+                         levels = c("MS", "Other")),
+    id = "all"
+  )
+```
+
+```{r naive-bootstrap-rng}
+# The published run bootstrapped 10 naive metrics here (N_BOOT study-level resamples each)
+# before nested CV. That comparison is not in the paper, but nested-CV tuning continues
+# from the random state it left, so its draws are replayed to keep Fig 4 unchanged.
+all_authors <- unique(df$Author)
+set.seed(44)
+for (i in seq_len(10 * N_BOOT)) sample(all_authors, length(all_authors), replace = TRUE)
+```
+
+## 5. Feature Set Recipes
+
+```{r feature-recipes}
+# Prediction-derived feature names
+pred_features <- c("ms_score_median",
+                   "ms_score_85pct", "ms_score_90pct",
+                   "ms_score_95pct", "ms_score_99pct",
+                   "ms_score_85pct_weighted", "ms_score_90pct_weighted",
+                   "ms_score_95pct_weighted", "ms_score_99pct_weighted",
+                   "ms_score_sd")
+
+# ID / metadata columns that must never be predictors
+id_cols <- c("Author", "Subject", "Disease", "BSource", "n_seqs")
+
+# Detect which feature families are present
+has_cw <- any(grepl("^CW\\d+", names(df)))
+has_g  <- any(grepl("^G\\d+", names(df)))
+
+# --- Recipe 1: Fraction features only ---
+recipe_fraction <- recipe(Disease_binary ~ ., data = df) %>%
+  update_role(all_of(id_cols), new_role = "ID") %>%
+  step_rm(starts_with("W"), starts_with("CW"), starts_with("G")) %>%
+  step_scale() %>%
+  step_center()
+
+# --- Recipe 2: Reconstruction waypoints only ---
+recipe_waypoints <- recipe(Disease_binary ~ ., data = df) %>%
+  update_role(all_of(id_cols), new_role = "ID") %>%
+  step_rm(all_of(pred_features), starts_with("CW"), starts_with("G")) %>%
+  step_scale() %>%
+  step_center()
+
+# --- Recipe 3: Combined (fraction + contrastive waypoints) ---
+recipe_combined <- recipe(Disease_binary ~ ., data = df) %>%
+  update_role(all_of(id_cols), new_role = "ID") %>%
+  step_rm(matches("^W\\d+"), starts_with("G")) %>%
+  step_scale() %>%
+  step_center()
+
+experiments <- list(
+  "Waypoints only" = recipe_waypoints,
+  "Combined"       = recipe_combined
+)
+
+# --- Recipe 4: Contrastive waypoints only (if available) ---
+if (has_cw) {
+  recipe_contrastive <- recipe(Disease_binary ~ ., data = df) %>%
+    update_role(all_of(id_cols), new_role = "ID") %>%
+    step_rm(all_of(pred_features), matches("^W\\d+"), starts_with("G")) %>%
+    step_scale() %>%
+    step_center()
+  experiments[["Contrastive WP only"]] <- recipe_contrastive
+}
+
+cat("Experiments:", paste(names(experiments), collapse = ", "), "\n")
+
+# Viridis colour palette keyed by experiment name
+EXPERIMENT_COLOURS <- make_viridis_palette(names(experiments))
+
+# Validate config references
+stopifnot(
+  "SHAP_MODEL must match an experiment" = SHAP_MODEL %in% names(experiments),
+  "THRESHOLD_MODEL must match an experiment" = THRESHOLD_MODEL %in% names(experiments)
+)
+if (!is.null(ACTIVE_MODELS)) {
+  bad <- setdiff(ACTIVE_MODELS, names(experiments))
+  if (length(bad) > 0) warning("ACTIVE_MODELS not found in experiments: ", paste(bad, collapse = ", "))
+}
+```
+
+## 6. XGBoost Spec & Tuning Grid
+
+```{r xgb-spec}
+xgb_spec <- boost_tree(
+  trees       = 500,
+  tree_depth  = tune(),
+  min_n       = tune(),
+  mtry        = tune(),
+  sample_size = tune(),
+  learn_rate  = tune()
+) %>%
+  set_engine("xgboost", scale_pos_weight = pos_weight, nthread = 1L) %>%
+  set_mode("classification")
+```
+
+## 7. Nested Cross-Validation
+
+Proper nested CV: for each outer fold, tune hyperparameters on inner folds from
+the training data only, then predict on the held-out outer fold. This gives
+unbiased performance estimates (no information leakage from HP selection).
+
+```{r run-nested-cv}
+# Parallel workers for tuning (default: all cores but one, at least 2; BCRM_PATIENT_WORKERS sets the
+# number). The published results came from parallel tuning, and parallel results are identical for any
+# number of workers (checked with 7 and 15). Sequential tuning (BCRM_PATIENT_WORKERS=1) draws random
+# numbers differently and gives slightly different results. The cluster is stopped in the last chunk:
+# an on.exit() here would fire as soon as knitr finishes the line and leave tuning sequential.
+n_cores <- as.integer(Sys.getenv("BCRM_PATIENT_WORKERS", max(2L, parallelly::availableCores() - 1L)))
+if (n_cores > 1) {
+  cl <- parallel::makeCluster(n_cores)
+  parallel::clusterExport(cl, varlist = c("pos_weight", "pred_features"),
+                          envir = globalenv())
+  doParallel::registerDoParallel(cl)
+} else foreach::registerDoSEQ()
+
+make_tuning_grid <- function(recipe) {
+  prepped  <- prep(recipe)
+  n_pred   <- ncol(bake(prepped, new_data = NULL)) - 1L
+  grid_latin_hypercube( 
+    tree_depth(range = c(2L, 5L)),
+    min_n(range = c(3L, 10L)),
+    mtry(range = c(1L, max(1L, n_pred))),
+    sample_prop(range = c(0.5, 0.9)),
+    learn_rate(range = c(-2.3, -1.3), trans = scales::log10_trans()),
+    size = 30
+  )
+}
+
+# BATCH_MODE "fold": removeBatchEffect's model (feature ~ Disease_binary + BSource, sum contrasts for
+# BSource) fitted on the training patients only; the tissue effects are then subtracted from training
+# and test patients alike. A tissue source absent from the training fold is left uncorrected.
+fold_batch_correct <- function(train, test) {
+  lv <- sort(unique(train$BSource))
+  if (length(lv) < 2) return(list(train = train, test = test))
+  batch_design <- function(d) {
+    known <- d$BSource %in% lv
+    b <- factor(ifelse(known, d$BSource, lv[1]), levels = lv)
+    X <- model.matrix(~ b, contrasts.arg = list(b = contr.sum(length(lv))))[, -1, drop = FALSE]
+    X[!known, ] <- 0
+    X
+  }
+  Xd   <- model.matrix(~ Disease_binary, data = train)
+  Xb   <- batch_design(train)
+  fit  <- lm.fit(cbind(Xd, Xb), as.matrix(train[, emb_cols]))
+  beta <- fit$coefficients[ncol(Xd) + seq_len(ncol(Xb)), , drop = FALSE]
+  beta[is.na(beta)] <- 0
+  correct <- function(d) { d[, emb_cols] <- as.matrix(d[, emb_cols]) - batch_design(d) %*% beta; d }
+  list(train = correct(train), test = correct(test))
+}
+
+run_nested_cv <- function(recipe, outer_folds, spec, n_inner = 4) {
+  xgb_grid <- make_tuning_grid(recipe)
+
+  map_dfr(seq_along(outer_folds$splits), function(i) {
+    split_i    <- outer_folds$splits[[i]]
+    fold_id    <- outer_folds$id[[i]]
+    train_data <- analysis(split_i)
+    test_data  <- assessment(split_i)
+    if (BATCH_MODE == "fold") {
+      corrected  <- fold_batch_correct(train_data, test_data)
+      train_data <- corrected$train
+      test_data  <- corrected$test
+    }
+
+    # Guard: ensure enough author groups for inner CV
+    n_authors_train <- n_distinct(train_data$Author)
+    actual_inner    <- min(n_inner, max(2L, n_authors_train - 1L))
+    if (actual_inner < n_inner) {
+      cat("  Fold", fold_id, ": reducing inner folds to", actual_inner,
+          "(only", n_authors_train, "authors in training set)\n")
+    }
+
+    inner_folds <- group_vfold_cv(train_data, group = "Author", v = actual_inner)
+
+    wf <- workflow() %>% add_recipe(recipe) %>% add_model(spec)
+
+    inner_tune <- tune_grid(
+      wf,
+      resamples = inner_folds,
+      grid      = xgb_grid,
+      metrics   = metric_set(roc_auc),
+      control   = control_grid(verbose = TRUE)
+    )
+
+    best_inner <- select_best(inner_tune, metric = "roc_auc")
+    final_wf   <- finalize_workflow(wf, best_inner)
+    fit_outer  <- fit(final_wf, data = train_data)
+
+    # Collect both probabilities and hard class predictions
+    preds <- bind_cols(
+      predict(fit_outer, new_data = test_data, type = "prob"),
+      predict(fit_outer, new_data = test_data, type = "class") %>%
+        rename(.pred_class = .pred_class)
+    ) %>%
+      bind_cols(
+        select(test_data, Author, Subject, Disease_binary, Disease, BSource, n_seqs)
+      ) %>%
+      mutate(id = fold_id)
+
+    cat("  Fold", fold_id, ": n_test =", nrow(test_data),
+        "| inner best AUC =", round(show_best(inner_tune, metric = "roc_auc", n = 1)$mean, 3), "\n")
+
+    preds
+  })
+}
+
+nested_results <- imap(experiments, ~ {
+  cat("=== Nested CV:", .y, "===\n")
+  run_nested_cv(.x, cv_folds, xgb_spec, n_inner = N_INNER_FOLDS)
+})
+```
+
+## 8. Fig 4A — Feature Set Comparison (overlaid ROC curves)
+
+```{r fig4c-comparison-roc}
+# Filter to active models
+active_results <- if (!is.null(ACTIVE_MODELS)) {
+  nested_results[intersect(ACTIVE_MODELS, names(nested_results))]
+} else {
+  nested_results
+}
+
+# Prepend naive baseline so it appears in the ROC overlay and bootstraps
+active_results <- c(list("Naive (ms_score_90pct)" = naive_preds), active_results)
+
+# Colour palette: grey for naive, viridis for XGBoost experiments
+EXPERIMENT_COLOURS[["Naive (ms_score_90pct)"]] <- "grey50"
+
+# Compute AUC and label each experiment's predictions
+cv_preds_list <- imap(active_results, ~ {
+  auc_val <- roc_auc_vec(.x$Disease_binary, .x$.pred_MS)
+  .x %>% mutate(experiment = paste0(.y, " (AUC = ", round(auc_val, 3), ")"))
+})
+
+all_cv_preds <- bind_rows(cv_preds_list)
+
+# Compute ROC curves
+roc_curves <- all_cv_preds %>%
+  group_by(experiment) %>%
+  roc_curve(truth = Disease_binary, .pred_MS)
+
+# Build a colour map keyed by the AUC-annotated experiment labels
+exp_label_colours <- setNames(
+  EXPERIMENT_COLOURS[names(active_results)],
+  imap_chr(active_results, ~ {
+    auc_val <- roc_auc_vec(.x$Disease_binary, .x$.pred_MS)
+    paste0(.y, " (AUC = ", round(auc_val, 3), ")")
+  })
+)
+
+p_fig4c <- ggplot(roc_curves, aes(x = 1 - specificity, y = sensitivity, colour = experiment)) +
+  geom_path(linewidth = 0.9) +
+  geom_abline(lty = 2, colour = "grey50") +
+  scale_colour_manual(values = exp_label_colours) +
+  coord_fixed(ratio = 1) +
+  theme_linedraw(base_size = 10) +
+  labs(title = "Fig 4A: Feature set comparison",
+       x = "1 - Specificity", y = "Sensitivity", colour = NULL) +
+  theme(legend.position = c(0.65, 0.25),
+        legend.background = element_rect(fill = alpha("white", 0.8)),
+        aspect.ratio = 1, panel.grid = element_blank())
+p_fig4c
+ggsave(file.path(FIGURES_DIR, "fig4A_feature_set_roc.svg"), p_fig4c, width = 2.5, height = 2.5)
+
+# Pooled cross-validated AUC per feature set (the numbers in the Fig. 4A legend)
+imap_dfr(active_results, ~ tibble(feature_set = .y, n = nrow(.x),
+                                  auc = roc_auc_vec(.x$Disease_binary, .x$.pred_MS))) %>%
+  mutate(batch_correction = BATCH_MODE) %>%
+  write_csv(file.path(INTERMEDIATES_DIR, "patient_classifier_auc.csv"))
+```
+
+## 8b. Study-Level Bootstrap AUC Boxplots
+
+Resample Author groups with replacement to estimate AUC uncertainty that
+accounts for between-study variability.
+
+```{r bootstrap-auc-boxplot}
+set.seed(42)
+
+all_authors <- unique(df$Author)
+
+boot_auc_df <- imap_dfr(active_results, function(preds, exp_name) {
+  map_dfr(seq_len(N_BOOT), function(b) {
+    boot_authors <- sample(all_authors, length(all_authors), replace = TRUE)
+
+    # Gather predictions for each resampled author (duplicates allowed)
+    boot_data <- map_dfr(seq_along(boot_authors), function(j) {
+      preds %>% filter(Author == boot_authors[j]) %>% mutate(.boot_id = j)
+    })
+
+    if (n_distinct(boot_data$Disease_binary) < 2) return(tibble())
+
+    tibble(
+      experiment = exp_name,
+      boot       = b,
+      auc        = roc_auc_vec(boot_data$Disease_binary, boot_data$.pred_MS)
+    )
+  })
+})
+
+# Observed (point) AUCs for annotation
+obs_aucs <- imap_dfr(active_results, ~ {
+  tibble(
+    experiment = .y,
+    auc = roc_auc_vec(.x$Disease_binary, .x$.pred_MS)
+  )
+})
+
+boot_auc_df <-
+  boot_auc_df %>%
+  mutate(experiment = fct_reorder(experiment, auc, .desc = T))
+
+p_boot_auc <- ggplot(boot_auc_df, aes(x = auc, y = experiment, fill = experiment)) +
+  geom_boxplot(outlier.size = 0.5, notch = TRUE) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", colour = "grey60") +
+  scale_fill_manual(values = EXPERIMENT_COLOURS) +
+  theme_linedraw(base_size = 8) +
+  theme(legend.position = "none", panel.grid = element_blank(), aspect.ratio = 1) +
+  labs(
+    x     = paste0("ROC AUC (", N_BOOT, " study-level bootstrap resamples)"),
+    y     = NULL,
+    title = "Study-level bootstrap AUC distribution"
+  )
+p_boot_auc
+ggsave(file.path(FIGURES_DIR, "fig4B_bootstrap_auc_boxplot.svg"),
+       p_boot_auc, width = 2.5, height = 2.5)
+```
+
+## 9. Fig 4E — Sequence Threshold Sweep (filter-based, no refitting)
+
+Instead of fitting new models at each threshold, filter the existing nested CV
+predictions to patients meeting that threshold and compute AUC on the subset.
+
+```{r fig4d-threshold-sweep}
+thresholds <- c(100, 200, 500, 1000, 10000)
+
+# Predictions from the chosen model (already include n_seqs from nested CV)
+stopifnot(
+  "`THRESHOLD_MODEL` not found in nested_results — check that nested CV ran successfully" =
+    THRESHOLD_MODEL %in% names(nested_results)
+)
+threshold_preds <- nested_results[[THRESHOLD_MODEL]]
+
+set.seed(8675309)
+safe_roc_auc <- possibly(roc_auc_vec, otherwise = NA_real_)
+
+# Study-level bootstrap at each threshold
+sweep_boot <- map_dfr(thresholds, function(thr) {
+  filtered <- threshold_preds %>% filter(n_seqs <= thr) #switched
+
+  if (nrow(filtered) < 10 || n_distinct(filtered$Disease_binary) < 2) {
+    warning("Threshold ", thr, ": insufficient data (n=", nrow(filtered), "), skipping")
+    return(tibble())
+  }
+
+  filt_authors <- unique(filtered$Author)
+
+  map_dfr(seq_len(N_BOOT), function(b) {
+    boot_authors <- sample(filt_authors, length(filt_authors), replace = TRUE)
+    boot_data <- map_dfr(seq_along(boot_authors), function(j) {
+      filtered %>% filter(Author == boot_authors[j]) %>% mutate(.boot_id = j)
+    })
+    if (n_distinct(boot_data$Disease_binary) < 2) return(tibble())  # AUC needs both classes
+
+    tibble(
+      threshold = paste0("\u2264 ", thr),
+      boot      = b,
+      auc       = safe_roc_auc(boot_data$Disease_binary, boot_data$.pred_MS),
+      n         = nrow(filtered)
+    )
+  })
+})
+
+# Order thresholds by numeric value
+lvls <- paste0("\u2264 ", sort(thresholds))
+sweep_boot$threshold <- factor(sweep_boot$threshold, levels = lvls)
+#obs_sweep$threshold  <- factor(obs_sweep$threshold,  levels = lvls)
+
+sweep_boot <- 
+  sweep_boot %>%
+  filter(!is.na(threshold))
+
+p_fig4d <- ggplot(sweep_boot, aes(x = auc, y = threshold)) +
+  geom_boxplot(fill = viridis::viridis(1, begin = 0.4), outlier.size = 0.5, notch = TRUE) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", colour = "grey60") +
+  #geom_text(data = obs_sweep, aes(label = paste0("n=", n)),
+            #x = -Inf, hjust = -0.2, size = 2.5) +
+  theme_linedraw(base_size = 8) +
+  theme(panel.grid = element_blank(), aspect.ratio = 1) +
+  labs(
+    title = paste0("Fig 4E: AUC by max sequence count (", THRESHOLD_MODEL, ")"),
+    x     = paste0("ROC AUC (", N_BOOT, " study-level bootstrap resamples)"),
+    y     = "Max sequences"
+  )
+p_fig4d
+ggsave(file.path(FIGURES_DIR, "fig4E_max_sequences_auc.svg"), p_fig4d, width = 2.5, height = 2.5)
+```
+
+## 10. Fig 4C — Tissue-Specific AUC Comparison
+
+Study-level bootstrap AUC comparing overall, blood-only, and CSF-only subsets
+of the patient classifier predictions.
+
+```{r tissue-bootstrap-auc}
+set.seed(45)
+tissue_subsets <- list(
+  "Overall" = threshold_preds,
+  "Blood"   = threshold_preds %>% filter(BSource == "Blood")
+  #"CSF"     = threshold_preds %>% filter(BSource == "CSF")
+)
+
+tissue_boot <- imap_dfr(tissue_subsets, function(preds, subset_name) {
+  filt_authors <- unique(preds$Author)
+  n_patients   <- nrow(preds)
+  if (n_patients < 3 || n_distinct(preds$Disease_binary) < 2) {
+    warning(subset_name, ": insufficient data (n=", n_patients, "), skipping")
+    return(tibble())
+  }
+  map_dfr(seq_len(N_BOOT), function(b) {
+    boot_authors <- sample(filt_authors, length(filt_authors), replace = TRUE)
+    boot_data <- map_dfr(seq_along(boot_authors), function(j) {
+      preds %>% filter(Author == boot_authors[j]) %>% mutate(.boot_id = j)
+    })
+    boot_data <- boot_data %>%
+      mutate(Disease_binary = factor(as.character(Disease_binary), levels = c("MS", "Other")))
+    if (n_distinct(boot_data$Disease_binary) < 2) return(tibble())
+    tibble(subset = subset_name, boot = b,
+           auc = safe_roc_auc(boot_data$Disease_binary, boot_data$.pred_MS))
+  }) %>% mutate(n = n_patients)
+})
+
+tissue_boot$subset <- factor(tissue_boot$subset, levels = c("Overall", "Blood", "CSF"))
+
+# Annotation: sample sizes per subset
+tissue_n <- tissue_boot %>% distinct(subset, n)
+
+p_tissue <- ggplot(tissue_boot, aes(x = auc, y = subset, fill = subset)) +
+  geom_boxplot(outlier.size = 0.5, notch = TRUE) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", colour = "grey60") +
+  geom_text(data = tissue_n, aes(label = paste0("n=", n)),
+            x = -Inf, hjust = -0.2, size = 2.5) +
+  scale_fill_viridis_d(option = "D", begin = 0.2, end = 0.8) +
+  theme_linedraw(base_size = 10) +
+  theme(legend.position = "none", panel.grid = element_blank(), aspect.ratio = 1) +
+  labs(x = paste0("ROC AUC (", N_BOOT, " study-level bootstraps)"), y = NULL,
+       title = paste0("Tissue-specific ROC AUC (", THRESHOLD_MODEL, ")"))
+p_tissue
+ggsave(file.path(FIGURES_DIR, "fig4C_tissue_bootstrap_auc.svg"),
+       p_tissue, width = 2.5, height = 2.5)
+```
+
+## 11. Final Model for SHAP
+
+Tune hyperparameters on the full dataset using inner CV, then fit the final
+model on all data. This is standard: nested CV above gives unbiased evaluation,
+this separate tuning gives the best model for interpretation/SHAP.
+
+```{r final-model}
+cat("Training final model using:", SHAP_MODEL, "\n")
+
+shap_recipe <- experiments[[SHAP_MODEL]]
+shap_grid   <- make_tuning_grid(shap_recipe)
+
+full_inner_folds <- group_vfold_cv(df, group = "Author", v = N_INNER_FOLDS)
+
+full_tune <- tune_grid(
+  workflow() %>% add_recipe(shap_recipe) %>% add_model(xgb_spec),
+  resamples = full_inner_folds,
+  grid      = shap_grid,
+  metrics   = metric_set(roc_auc)
+)
+
+best_final <- select_best(full_tune, metric = "roc_auc")
+
+final_workflow <- finalize_workflow(
+  workflow() %>% add_recipe(shap_recipe) %>% add_model(xgb_spec),
+  best_final
+)
+final_fit  <- fit(final_workflow, data = df)
+xgb_engine <- extract_fit_engine(final_fit)
+```
+
+## 12. SHAP Analysis
+
+```{r shap-analysis}
+# Build predictor matrix dynamically from the SHAP_MODEL recipe
+prepped_shap <- prep(shap_recipe)
+baked_shap   <- bake(prepped_shap, new_data = df)
+pred_cols    <- prepped_shap$term_info %>%
+  filter(role == "predictor") %>% pull(variable)
+X_matrix     <- baked_shap %>% select(all_of(pred_cols)) %>% as.matrix()
+
+shap_values <- shap.values(xgb_model = xgb_engine, X_train = X_matrix)
+
+cat("SHAP model:", SHAP_MODEL, "\n")
+```
+
+## 12b. Export Intermediates for Downstream Notebooks
+
+```{r export-intermediates}
+# Mean SHAP importance ranking (absolute + signed + per-patient significance).
+# Read by shap_nearest_sequences.py and shap_waypoint_sequences.Rmd (Fig 4F).
+signed_means <- colMeans(as.matrix(shap_values$shap_score))
+
+# One-sample Wilcoxon signed-rank test per feature: H0 = SHAP ≡ 0 across patients
+shap_mat <- as.matrix(shap_values$shap_score)
+shap_p <- apply(shap_mat, 2, function(x) {
+  if (sd(x) < 1e-10) return(1.0)
+  wilcox.test(x, mu = 0, exact = FALSE)$p.value
+})
+shap_fdr <- p.adjust(shap_p, method = "BH")
+
+shap_ranking <- tibble(
+  feature          = names(shap_values$mean_shap_score),
+  mean_shap        = unname(shap_values$mean_shap_score),
+  signed_mean_shap = unname(signed_means[names(shap_values$mean_shap_score)]),
+  p_value          = unname(shap_p[names(shap_values$mean_shap_score)]),
+  fdr_p            = unname(shap_fdr[names(shap_values$mean_shap_score)])
+) %>% arrange(desc(mean_shap))
+write_csv(shap_ranking,
+          file.path(INTERMEDIATES_DIR, "shap_feature_ranking.csv"))
+```
+
+## 13. Fig 4D — Disease-Subset AUC Heatmap
+
+```{r fig4e-disease-auc-heatmap}
+# Define subsets: "All" uses all patients, others filter to MS + that category
+disease_subsets <- list(
+  "vs All"        = NULL,                    # no filter — full dataset
+  "vs Autoimmune" = "Autoimmune Disease",
+  "vs Infectious" = "Infectious Disease",
+  "vs Healthy"    = "Healthy"
+)
+
+safe_roc_auc <- possibly(roc_auc_vec, otherwise = NA_real_)
+
+heatmap_df <- imap_dfr(active_results, function(preds, model_name) {
+  map_dfr(names(disease_subsets), function(subset_label) {
+    other_disease <- disease_subsets[[subset_label]]
+    if (is.null(other_disease)) {
+      sub <- preds                               # all patients
+    } else {
+      sub <- preds %>%
+        filter(Disease == "Multiple sclerosis" | Disease == other_disease)
+    }
+    if (nrow(sub) < 10 || n_distinct(sub$Disease_binary) < 2) {
+      return(tibble(model = model_name, subset = subset_label,
+                    auc = NA_real_, n = nrow(sub)))
+    }
+    tibble(
+      model  = model_name,
+      subset = subset_label,
+      auc    = safe_roc_auc(sub$Disease_binary, sub$.pred_MS),
+      n      = nrow(sub)
+    )
+  })
+})
+
+# Factor ordering
+heatmap_df$subset <- factor(heatmap_df$subset, levels = names(disease_subsets))
+heatmap_df$model  <- factor(heatmap_df$model,  levels = rev(names(active_results)))
+
+p_fig4e <- ggplot(heatmap_df, aes(x = subset, y = model, fill = auc)) +
+  geom_tile(colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = sprintf("%.2f\n(n=%d)", auc, n)),
+            size = 2.5, colour = "black") +
+  scale_fill_viridis_c(option = "D", begin = 0.2, end = 0.95,
+                        limits = c(0.5, 1), oob = scales::squish,
+                        name = "ROC AUC") +
+  theme_linedraw(base_size = 10) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(x = NULL, y = NULL,
+       title = "Fig 4D: AUC by disease subset")
+p_fig4e
+ggsave(file.path(FIGURES_DIR, "fig4D_disease_subset_auc.svg"),
+       p_fig4e, width = 4, height = 2.5)
+```
+
+```{r stop-cluster, include=FALSE}
+if (n_cores > 1) parallel::stopCluster(cl)
+foreach::registerDoSEQ()
+```

@@ -1,0 +1,133 @@
+---
+title: "TRUST4 sequences by chain and tissue (Fig. 1E, Supplemental Table 1)"
+---
+
+Moved from `dataset/build_dataset.Rmd` ("TRUST4 compact isotype summary") so the figure stage can
+make it without rebuilding the dataset. Unfiltered (no productive / complete-VDJ filter): the raw
+extraction yield per chain type / isotype, SRA studies only.
+
+```{r setup}
+source(here::here("R", "paths.R"))
+source(here::here("R", "trust4_files.R"))
+source(here::here("R", "metadata.R"))
+library(tidyverse)
+library(vroom)
+```
+
+```{r Fig 1E: sequences by chain and tissue}
+sra_meta_sum <- read_metadata() %>%
+  select(Run, BioProject, create_date, Tissue, Age, Sex, DonorID, Disease)
+
+# Step 1: classify chain type and aggregate per (SRA, chain_type) — no join yet
+trust4_sra <-
+  vroom(data_path("sequences/master-trust4-dataset-sequence-unfiltered.csv"),
+        col_select = c(file_name, v_call, c_call), show_col_types = FALSE) %>%
+  filter(file_name %in% keep_one_file_per_run(unique(file_name))) %>%   # one file per run (R/trust4_files.R)
+  mutate(
+    SRA = str_extract(file_name, "(SRR|ERR)[0-9]+"),
+    chain_type = case_when(
+      str_starts(v_call, "IGHV") ~ coalesce(c_call, "IGH_unknown"),
+      str_starts(v_call, "IGKV") ~ "IGK",
+      str_starts(v_call, "IGLV") ~ "IGL",
+      str_starts(v_call, "TR")   ~ "TCR",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(SRA), !is.na(chain_type)) %>%
+  group_by(SRA, chain_type) %>%
+  summarise(n_seqs = n(), .groups = "drop")
+
+# Step 2: join the small (SRA × chain_type) table to metadata — fast
+trust4_pre_meta <- trust4_sra %>%
+  left_join(sra_meta_sum, by = c("SRA" = "Run")) %>%
+  filter(!is.na(Disease), !is.na(BioProject)) %>%
+  mutate(tissue_group = case_when(
+    Tissue %in% c('Brain', 'Brain-Lesion', 'Cortex', 'Choroid-Plexus', 'Pia-Mater') ~ 'Brain',
+    Tissue %in% c('Cerebrospinal-Fluid', 'CSF')  ~ 'CSF',
+    Tissue %in% c('Blood', 'PBMC')                ~ 'Blood',
+    TRUE ~ 'Other'
+  ))
+
+total_seqs <- sum(trust4_pre_meta$n_seqs)
+
+trust4_pre_meta %>%
+  group_by(Chain_Type = chain_type) %>%
+  summarise(
+    N_seqs    = sum(n_seqs),
+    Pct       = round(100 * sum(n_seqs) / total_seqs, 1),
+    Pct_Blood = round(100 * sum(n_seqs[tissue_group == 'Blood']) / sum(n_seqs), 1),
+    Pct_CSF   = round(100 * sum(n_seqs[tissue_group == 'CSF'])   / sum(n_seqs), 1),
+    Pct_Brain = round(100 * sum(n_seqs[tissue_group == 'Brain']) / sum(n_seqs), 1),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(N_seqs)) -> fig1e_table
+
+FIGURES_DIR <- out_path("figures")
+dir.create(FIGURES_DIR, showWarnings = FALSE, recursive = TRUE)
+write_csv(fig1e_table, file.path(FIGURES_DIR, "fig1E_sequences_by_chain_and_tissue.csv"))
+
+fig1e_table %>%
+  knitr::kable(
+    caption = "TRUST4 sequences by chain/isotype (unfiltered; SRA studies only)",
+    col.names = c("Chain / Isotype", "N seqs", "% total", "% Blood", "% CSF", "% Brain")
+  )
+```
+
+```{r Supplemental Table 1: per-study statistics}
+# One row per BioProject — full per-study breakdown for a supplemental figure/table.
+# All Pct_ values are fractions of total sequences across all chain types.
+
+# Per-subject total sequences (all chain types)
+subj_counts_bp <- trust4_pre_meta %>%
+  group_by(BioProject, DonorID) %>%
+  summarise(subj_seqs = sum(n_seqs), .groups = 'drop')
+
+# Donor-level demographics — deduplicated to avoid inflating median / counts
+donor_stats <- trust4_pre_meta %>%
+  distinct(BioProject, DonorID, Age, Sex) %>%
+  group_by(BioProject) %>%
+  summarise(
+    N_female   = sum(Sex == 'Female', na.rm = TRUE),
+    N_male     = sum(Sex == 'Male',   na.rm = TRUE),
+    Median_age = round(median(as.numeric(Age), na.rm = TRUE), 1),
+    .groups = 'drop'
+  )
+
+trust4_pre_meta %>%
+  group_by(BioProject) %>%
+  summarise(
+    Disease_categories = paste(sort(unique(Disease)), collapse = ' / '),
+    N_subjects         = n_distinct(DonorID),
+    N_seqs             = sum(n_seqs),
+    Tissues            = paste(sort(unique(tissue_group[tissue_group != 'Other'])), collapse = ', '),
+    Pct_IgM = round(100 * sum(n_seqs[chain_type == 'IGHM'])                / sum(n_seqs), 1),
+    Pct_IgG = round(100 * sum(n_seqs[str_starts(chain_type, 'IGHG')])      / sum(n_seqs), 1),
+    Pct_IgA = round(100 * sum(n_seqs[str_starts(chain_type, 'IGHA')])      / sum(n_seqs), 1),
+    Pct_IGK = round(100 * sum(n_seqs[chain_type == 'IGK'])                 / sum(n_seqs), 1),
+    Pct_IGL = round(100 * sum(n_seqs[chain_type == 'IGL'])                 / sum(n_seqs), 1),
+    Pct_TCR = round(100 * sum(n_seqs[chain_type == 'TCR'])                 / sum(n_seqs), 1),
+    Year    = year(min(create_date, na.rm = TRUE)),
+    .groups = 'drop'
+  ) %>%
+  left_join(
+    subj_counts_bp %>%
+      group_by(BioProject) %>%
+      summarise(Median_seqs_subject = round(median(subj_seqs)), .groups = 'drop'),
+    by = 'BioProject'
+  ) %>%
+  left_join(donor_stats, by = 'BioProject') %>%
+  select(BioProject, Disease_categories, N_subjects, N_seqs, Median_seqs_subject,
+         Tissues, Pct_IgM, Pct_IgG, Pct_IgA, Pct_IGK, Pct_IGL, Pct_TCR,
+         N_female, N_male, Median_age, Year) %>%
+  arrange(desc(N_subjects)) -> table_s1
+
+write_csv(table_s1, file.path(FIGURES_DIR, "tableS1_sra_studies.csv"))
+
+table_s1 %>%
+  knitr::kable(
+    caption = "TRUST4 SRA studies: pre-sampling statistics (all chain types, unfiltered)",
+    col.names = c("BioProject", "Diseases", "N subjects", "N seqs", "Median seqs/subj",
+                  "Tissues", "% IgM", "% IgG", "% IgA", "% IGK", "% IGL", "% TCR",
+                  "N female", "N male", "Median age", "Year")
+  )
+```

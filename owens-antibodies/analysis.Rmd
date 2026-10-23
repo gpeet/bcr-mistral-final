@@ -1,0 +1,117 @@
+---
+title: "Owens holdout analysis — sequence & junction classifiers"
+---
+
+```{r setup}
+source(here::here("R", "paths.R"))
+library(tidyverse)
+library(patchwork)
+library(knitr)
+
+FIGURES_DIR <- out_path("figures")
+dir.create(FIGURES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+PRED_CSV      <- out_path("owens/owens_predictions.csv")
+PER_MODEL_CSV <- out_path("owens/owens_predictions_per_model.csv")
+
+# Key physically characterized sequences (update as needed)
+KEY_SEQS <- c("2B4",
+              "ON-07-07CSF138VH-34_CH3a", "ON-07-07CSF138VH-49_CH3a",
+              "MS04-2PH30-CH3A", "MS04-2PH11-CH4")
+```
+
+```{r key-seq-labels}
+# Map sequence IDs → plot display labels.
+# Edit the right-hand values to set human-readable names for all plots.
+KEY_SEQ_LABELS <- c(
+  "2B4"                       = "2B4 Control",
+  "ON-07-07CSF138VH-34_CH3a"  = "ON-07-07#34",
+  "ON-07-07CSF138VH-49_CH3a"  = "ON-07-07#49",
+  "MS04-2PH30-CH3A"           = "MS04-2#30",
+  "MS04-2PH11-CH4"            = "MS04-2#11" #,"MS04-2PH11-VH5"            = "MS04-2#11-VH5"
+)
+```
+
+```{r load-predictions}
+preds <- read_csv(PRED_CSV, show_col_types = FALSE)
+
+cat(sprintf("Loaded %d sequences\n", nrow(preds)))
+n_jxn_na <- sum(is.na(preds$ms_score_exclusion_junction))
+if (n_jxn_na > 0) cat(sprintf("  (%d with missing junction — junction scores are NA)\n", n_jxn_na))
+
+cat("\n--- Sequence classifiers ---\n")
+preds %>% count(predicted_class_exclusion, predicted_class_baseline)
+cat("\n--- Junction classifiers ---\n")
+preds %>% filter(!is.na(predicted_class_exclusion_junction)) %>%
+  count(predicted_class_exclusion_junction, predicted_class_baseline_junction)
+```
+
+```{r ensemble-bar-normalized}
+# Per-model junction exclusion predictions for KEY_SEQS, normalized to 2B4.
+# Each of 20 models (10 unflipped + 10 flipped) contributes one score per sequence.
+# Normalization: each model's score divided by the grand mean of 2B4 scores
+# across all 20 models → 2B4 retains its own variance / SEM.
+# Bar = mean ratio; error bar = SEM across the 20 models.
+per_model <- read_csv(PER_MODEL_CSV, show_col_types = FALSE)
+
+# Junction exclusion only; drop missing junctions
+jxn_data <- per_model %>%
+  filter(variant == "exclusion_junction", !is.na(ms_score)) %>%
+  filter(sequence_id %in% KEY_SEQS) %>%
+  mutate(display_label = KEY_SEQ_LABELS[sequence_id])
+
+# Grand mean of 2B4 across all model runs — single constant normalizer
+ctrl_mean <- jxn_data %>%
+  filter(sequence_id == "2B4") %>%
+  pull(ms_score) %>%
+  mean(na.rm = TRUE)
+
+# Normalize and summarise
+plot_df <- jxn_data %>%
+  mutate(norm_score = ms_score / ctrl_mean) %>%
+  group_by(display_label) %>%
+  summarise(
+    mean_norm = mean(norm_score,  na.rm = TRUE),
+    sem_norm  = sd(norm_score,    na.rm = TRUE) / sqrt(sum(!is.na(norm_score))),
+    .groups   = "drop"
+  )
+
+# Factor order: 2B4 Control first, then remaining sequences ascending by mean
+ctrl_label   <- KEY_SEQ_LABELS[["2B4"]]
+other_labels <- plot_df %>%
+  filter(display_label != ctrl_label) %>%
+  arrange(mean_norm) %>%
+  pull(display_label)
+label_order <- c(ctrl_label, other_labels)
+
+plot_df %>%
+  mutate(display_label = factor(display_label, levels = label_order)) %>%
+  ggplot(aes(x = display_label, y = mean_norm)) +
+  geom_col(fill = "#31688e", width = 0.6) +
+  geom_errorbar(aes(ymin = mean_norm - sem_norm,
+                    ymax = mean_norm + sem_norm),
+                width = 0.25, colour = "grey30") +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme_linedraw(base_size = 10) +
+  theme(panel.grid    = element_blank(),
+        axis.text.x   = element_text(angle = 45, hjust = 1), aspect.ratio = 1) +
+  labs(
+    x     = NULL,
+    y     = "P(MS) relative to 2B4 control (mean \u00b1 SEM)",
+    title = "Junction exclusion classifier — ensemble mean \u00b1 SEM, normalized to 2B4"
+  )
+
+ggsave(file.path(FIGURES_DIR, "fig3D_owens_prediction.svg"), width = 2, height = 2.5)
+```
+
+```{r results-table}
+preds %>%
+  filter(sequence_id %in% KEY_SEQS) %>%
+  mutate(display_label = KEY_SEQ_LABELS[sequence_id]) %>%
+  select(display_label, sequence_id, v_call, j_call, junction,
+         ms_score_exclusion_junction, predicted_class_exclusion_junction) %>%
+  mutate(across(starts_with("ms_score"), ~ round(.x, 4))) %>%
+  arrange(desc(ms_score_exclusion_junction)) %>%
+  kable(caption = "Key sequence predictions — junction exclusion classifier")
+```

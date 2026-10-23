@@ -1,0 +1,12 @@
+{
+  "best_trial": 200,
+  "best_val_combined": 0.272628883373343,
+  "lambda_contrastive": 0.25264433537789194,
+  "model": "WaypointAutoencoder_contrastive",
+  "params": {
+    "temperature": 0.39565813260451255,
+    "lr": 0.03337246046747959,
+    "n_seq_per_rep": 900,
+    "contrastive_temp": 0.05017584251939582
+  }
+}

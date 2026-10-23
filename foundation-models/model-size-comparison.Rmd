@@ -1,0 +1,68 @@
+---
+title: "Validation loss by model size (Fig. 2B)"
+output: html_notebook
+---
+
+```{r Packages}
+source(here::here("R", "paths.R"))
+library(tidyverse)
+library(yardstick)
+library(vroom)
+```
+
+```{r Foundation losses in validation set}
+eval_losses <- read_csv(out_path("foundation-models/foundation_models_eval_losses.csv")) %>%
+  mutate(
+    # Labelled by the parameter count of each architecture, counted from its config (the published
+    # figure called these 100M / 300M / 500M; only the largest was close). 2026-Foundation-* are the
+    # replications trained at the sizes the names claimed; they are a check, not a published panel.
+    model = recode(model,
+                   'model_256x1024' = '50M',
+                   'model_512x2048' = '151M',
+                   'model_512x2048-undiversified' = '151M Random Sample',
+                   'model_1024x4096' = '487M',
+                   'model_768x11' = '104M',
+                   'model_1024x20' = '304M',
+                   'model_1024x20-undiversified' = '304M Random Sample'),
+    text_col = recode(text_col,
+                      'junction' = 'CDR3',
+                      'sequence' = 'Complete VDJ'),
+    text_col = fct_rev(text_col)
+  )
+
+# Bootstrapped mean validation loss (1000 resamples) per model and input type
+plot_eval_loss <- function(models) {
+  eval_losses %>%
+    filter(model %in% models) %>%
+    mutate(model = factor(model, levels = models)) %>%
+    group_by(model, text_col) %>%
+    summarise(
+      boot_mean = replicate(1000, mean(sample(loss, replace = TRUE))),
+      .groups = "drop"
+    ) %>%
+    ggplot(aes(x = model, y = boot_mean, fill = model)) +
+    geom_boxplot(notch = T, outliers = F) +
+    theme_linedraw(base_size = 14) +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none") +
+    facet_wrap(vars(text_col), scales = "free") +
+    scale_fill_viridis_d() +
+    labs(y = "Mean CE Loss", x = "")
+}
+
+set.seed(42)
+plot_eval_loss(c('50M', '151M', '487M'))
+ggsave(out_path("figures/fig2B_validation_loss_by_model_size.svg"))
+
+# The same three models beside the 104M / 304M replications (trained with the same recipe for 23.5 h,
+# against 24 h for the 50M/151M models and 48 h for the 487M one). Not a published panel: at a fixed
+# time budget the deeper 304M model trains more slowly, so it does not beat the 151M one and size and
+# shape are confounded. Skipped unless those checkpoints have been trained and evaluated.
+if (all(c('104M', '304M') %in% eval_losses$model)) {
+  set.seed(42)
+  print(plot_eval_loss(c('50M', '104M', '151M', '304M', '487M')))
+  ggsave(out_path("figures/foundation_validation_loss_published_vs_sized.svg"))
+}
+```
+

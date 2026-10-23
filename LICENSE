@@ -1,0 +1,23 @@
+Copyright 2026 The Regents of the University of Colorado, a body corporate.
+All rights reserved.
+
+https://github.com/gpeet/bcr-mistral-final
+
+This repository accompanies the manuscript "Language Model Embedding Classifiers Enable
+Identification of Multiple Sclerosis-Associated BCRs and Repertoires" and is published so that the
+results reported there can be examined and verified.
+
+NO LICENCE IS GRANTED AT THIS TIME. In particular, no copyright licence and no patent licence,
+express or implied, is granted by the publication of this repository or of the accompanying model
+weights.
+
+Permission is granted only to view and download this repository and the accompanying model weights,
+and to run them for the purpose of examining or verifying the results reported in the manuscript.
+Redistribution, modification, incorporation into other software, commercial use, and any other use
+require written permission.
+
+A licence for wider use is expected to be added. For permissions, or to ask about the status of a
+licence, contact Graham Peet (graham.peet@cuanschutz.edu).
+
+The processed data released on Zenodo are licensed separately, under Creative Commons Attribution
+4.0 International (CC BY 4.0); see that record for its terms.

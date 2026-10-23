@@ -1,0 +1,486 @@
+---
+title: "Comparator Models — 2-fold CV"
+---
+
+```{r Load packages}
+source(here::here("R", "paths.R"))
+library(tidyverse)
+library(tidymodels)
+library(textrecipes)
+library(themis)
+library(vroom)
+library(protr)
+library(furrr)
+
+plan(multisession, workers = parallelly::availableCores())  # cores allocated to this job
+set.seed(42)  # 200k train/test subsamples below (unseeded in the published run)
+```
+
+```{r Load data}
+TRAIN_CSV <- data_path("classifier/classifier_data_igblast-train-weights.csv")
+TEST_CSV  <- data_path("classifier/classifier_data_igblast-test-weights.csv")
+OUT_BASE  <- out_path("sequence-classifier/comparator-output")
+
+# Load and keep original Disease label, then binarize for modelling
+train_raw <- vroom(TRAIN_CSV)
+test_raw  <- vroom(TEST_CSV)
+
+prep_data <- function(df) {
+  df %>%
+    mutate(
+      true_label = Disease,   # preserve original multi-class label for output CSVs
+      Disease    = factor(if_else(Disease == 'Multiple sclerosis', 'Multiple sclerosis', 'Other')),
+      weight     = importance_weights(weight)
+    )
+}
+
+train_raw <- prep_data(train_raw)
+test_raw  <- prep_data(test_raw)
+```
+
+```{r Direct sequence translation}
+# Pure-R codon-table lookup for adding junction_aa and sequence_aa.
+# The raw CSVs carry sequences clipped by build_dataset.Rmd using
+# v_sequence_start / j_sequence_end from IgBLAST.  The clip position is NOT
+# necessarily a codon boundary, so the reading frame (0, 1, or 2) varies per
+# sequence.  translate_nt() tries all three frames and returns the first
+# translation with no stop codons — for productive sequences exactly one
+# frame should be valid.
+#
+# Quality filters (a sequence is NA'd if any fail):
+#   1. Length ≥ 3 nt
+#   2. No ambiguous (non-ACGT) bases
+#   3. Translated region covers ≥ min_coverage of the original length
+#   4. No in-frame stop codons in the chosen reading frame
+
+
+.CODON_TABLE <- local({
+  # Standard genetic code: 1st base varies slowest (each 16), 3rd fastest.
+  # The aas vector is in NCBI / BioPython standard order (T-C-A-G for each
+  # position), so codons must be generated in the same order.
+  # NOTE: Do NOT use outer() here — it generates codons in column-major order
+  # (3rd base slowest) which scrambles the mapping.
+  b <- c("T","C","A","G")
+  codons <- paste0(
+    rep(b, each = 16),           # 1st base varies slowest
+    rep(rep(b, each = 4), 4),    # 2nd base varies middle
+    rep(b, 16)                   # 3rd base varies fastest
+  )
+  aas    <- c(
+    "F","F","L","L",  "S","S","S","S",  "Y","Y","*","*",  "C","C","*","W",
+    "L","L","L","L",  "P","P","P","P",  "H","H","Q","Q",  "R","R","R","R",
+    "I","I","I","M",  "T","T","T","T",  "N","N","K","K",  "S","S","R","R",
+    "V","V","V","V",  "A","A","A","A",  "D","D","E","E",  "G","G","G","G"
+  )
+  setNames(aas, codons)
+})
+
+translate_nt <- function(nt, min_coverage = 0.5) {
+  nt <- toupper(nt)
+  n  <- nchar(nt)
+  if (is.na(n) || n < 3L) return(NA_character_)
+
+  # Reject ambiguous bases up front (whole sequence)
+  if (grepl("[^ACGT]", nt, perl = TRUE)) return(NA_character_)
+
+  # Try all 3 reading frames; return first with no stop codons.
+  # For productive BCR sequences exactly one frame should be valid.
+  for (frame in 0:2) {
+    start_pos <- frame + 1L
+    n_usable  <- n - frame
+    n_trimmed <- (n_usable %/% 3L) * 3L
+
+    if (n_trimmed < 3L) next
+    if (n_trimmed / n < min_coverage) next
+
+    starts <- seq(start_pos, start_pos + n_trimmed - 3L, 3L)
+    codons <- substring(nt, starts, starts + 2L)
+    aas    <- .CODON_TABLE[codons]
+
+    if (anyNA(aas) || any(aas == "*")) next
+
+    return(paste(aas, collapse = ""))
+  }
+
+  NA_character_
+}
+
+# Vectorised over a character vector — parallel-safe, no external deps
+translate_seqs <- function(seqs, min_coverage = 0.5) {
+  vapply(seqs, translate_nt, character(1L), min_coverage = min_coverage,
+         USE.NAMES = FALSE)
+}
+
+add_aa_translations <- function(df, min_coverage = 0.5) {
+  df %>%
+    mutate(
+      junction_aa = translate_seqs(junction,  min_coverage),
+      sequence_aa = translate_seqs(sequence,  min_coverage)
+    )
+}
+
+train_ann <- add_aa_translations(train_raw)
+test_ann  <- add_aa_translations(test_raw)
+
+# Quality report
+report_translation <- function(df, label) {
+  n      <- nrow(df)
+  n_jaa  <- sum(!is.na(df$junction_aa))
+  n_saa  <- sum(!is.na(df$sequence_aa))
+  cat(sprintf(
+    "%s  |  junction_aa: %d / %d (%.1f%%)  |  sequence_aa: %d / %d (%.1f%%)\n",
+    label, n_jaa, n, 100 * n_jaa / n, n_saa, n, 100 * n_saa / n
+  ))
+}
+
+report_translation(train_ann, "train")
+report_translation(test_ann,  "test")
+```
+
+```{r Reduced protr feature extraction}
+# Retain PAAC (composition + order, 25 features) and Moran (physicochemical
+# autocorrelation, 40 features) = 65 total.
+# Drop CTriad (343 features, very sparse) and QSO (30 features, redundant
+# with PAAC) — reduces feature count from 438 to 65 with minimal info loss.
+
+extract_features_junction <- function(seq) {
+  c(extractPAAC(seq, lambda = 3),
+    extractMoran(seq, nlag = 3))
+}
+
+extract_features_vdj <- function(seq) {
+  # Longer sequences: use larger lag values matching original notebook
+  c(extractPAAC(seq, lambda = 15),
+    extractMoran(seq, nlag = 15))
+}
+
+# Featurize a data frame from an aa column name.
+# Filters out rows with NA, non-standard AA characters, or very short sequences.
+# Labels stay aligned because filtering is done on the full row before any join.
+featurize_protein <- function(df, aa_col, min_len = 5, extractor = extract_features_junction) {
+  df %>%
+    filter(
+      !is.na(.data[[aa_col]]),
+      !grepl("[^ACDEFGHIKLMNPQRSTVWY]", .data[[aa_col]]),
+      str_length(.data[[aa_col]]) > min_len
+    ) %>%
+    mutate(features = future_map(.data[[aa_col]], possibly(extractor, otherwise = NULL))) %>%
+    filter(!map_lgl(features, is.null)) %>%
+    unnest_wider(features, names_sep = "_", names_repair = 'universal')
+}
+```
+
+```{r Output helpers}
+make_predictions <- function(fit, test_data, chunk_size = 20000) {
+  n      <- nrow(test_data)
+  chunks <- split(seq_len(n), ceiling(seq_len(n) / chunk_size))
+  map(chunks, function(idx) {
+    chunk <- test_data[idx, , drop = FALSE]
+    probs <- predict(fit, new_data = chunk, type = "prob")
+    bind_cols(chunk, probs) %>%
+      transmute(
+        ms_score        = `.pred_Multiple sclerosis`,
+        predicted_class = if_else(ms_score >= 0.5, "Multiple sclerosis", "Other"),
+        true_label      = true_label,
+        weight          = as.numeric(weight),
+        Author, Subject
+      )
+  }) %>% bind_rows()
+}
+
+save_predictions <- function(pred_df, model_name, fold_name) {
+  out_path <- file.path(OUT_BASE, model_name, fold_name, "predictions", "ensemble_predictions.csv")
+  dir.create(dirname(out_path), recursive = TRUE, showWarnings = FALSE)
+  write_csv(pred_df, out_path)
+  cat("Saved:", out_path, "(", nrow(pred_df), "rows )\n")
+}
+```
+
+```{r 2-fold outer CV configuration}
+# Mirrors train_embedding_classifier_baseline.py outer fold structure:
+#   unflipped: train on TRAIN_CSV, predict on TEST_CSV
+#   flipped:   train on TEST_CSV,  predict on TRAIN_CSV
+# Together the two output files cover all sequences in the dataset.
+
+outer_folds <- list(
+  list(name = "unflipped", train_ann = train_ann, test_ann = test_ann),
+  list(name = "flipped",   train_ann = test_ann,  test_ann = train_ann)
+)
+```
+
+```{r Junction k-mer GLM, saved}
+# Sensible default: L1 logistic regression, penalty = 0.01 (matches original
+# fixed-penalty junction GLM that was already working well).
+
+for (fold in outer_folds) {
+  train_samp <- slice_sample(fold$train_ann, n = 200000, replace = FALSE)
+
+  kmer_recipe <-
+    recipe(Disease ~ junction + weight, data = train_samp) %>%
+    step_tokenize(junction, token = 'characters') %>%
+    step_ngram(junction, min_num_tokens = 7, num_tokens = 7) %>%
+    step_tokenfilter(junction, min_times = 100, max_tokens = 5000) %>%
+    step_tfidf(junction) %>%
+    step_nzv(all_predictors()) %>%
+    step_downsample(Disease)
+
+  kmer_fit <-
+    workflow() %>%
+    add_recipe(kmer_recipe) %>%
+    add_model(logistic_reg(penalty = 0.01, mixture = 1) %>% set_engine("glmnet")) %>%
+    add_case_weights(weight) %>%
+    fit(train_samp)
+
+  preds <- make_predictions(kmer_fit, fold$test_ann)
+  save_predictions(preds, "junction_kmer_glm", fold$name)
+}
+```
+
+```{r Junction k-mer RF, saved}
+# Sensible default: 500 trees, ranger defaults for mtry (sqrt of predictors)
+# and min_n = 5. No tuning needed — ranger defaults are robust.
+
+for (fold in outer_folds) {
+  train_samp <- slice_sample(fold$train_ann, n = 200000, replace = FALSE)
+
+  kmer_recipe <-
+    recipe(Disease ~ junction + weight, data = train_samp) %>%
+    step_tokenize(junction, token = 'characters') %>%
+    step_ngram(junction, min_num_tokens = 7, num_tokens = 7) %>%
+    step_tokenfilter(junction, min_times = 100, max_tokens = 5000) %>%
+    step_tfidf(junction) %>%
+    step_nzv(all_predictors()) %>%
+    step_downsample(Disease)
+
+  rf_fit <-
+    workflow() %>%
+    add_recipe(kmer_recipe) %>%
+    add_model(
+      rand_forest(trees = 500, min_n = 5) %>%
+        set_engine("ranger", num.threads = 8) %>%
+        set_mode("classification")
+    ) %>%
+    add_case_weights(weight) %>%
+    fit(train_samp)
+
+  preds <- make_predictions(rf_fit, fold$test_ann)
+  save_predictions(preds, "junction_kmer_rf", fold$name)
+}
+```
+
+```{r Sequence k-mer GLM, saved}
+# Full VDJ sequence 7-mers instead of junction-only.
+# Same recipe structure as junction k-mer GLM.
+
+for (fold in outer_folds) {
+  train_samp <- slice_sample(fold$train_ann, n = 200000, replace = FALSE)
+
+  kmer_recipe <-
+    recipe(Disease ~ sequence + weight, data = train_samp) %>%
+    step_tokenize(sequence, token = 'characters') %>%
+    step_ngram(sequence, min_num_tokens = 7, num_tokens = 7) %>%
+    step_tokenfilter(sequence, min_times = 100, max_tokens = 5000) %>%
+    step_tfidf(sequence) %>%
+    step_nzv(all_predictors()) %>%
+    step_downsample(Disease)
+
+  kmer_fit <-
+    workflow() %>%
+    add_recipe(kmer_recipe) %>%
+    add_model(logistic_reg(penalty = 0.01, mixture = 1) %>% set_engine("glmnet")) %>%
+    add_case_weights(weight) %>%
+    fit(train_samp)
+
+  preds <- make_predictions(kmer_fit, fold$test_ann)
+  save_predictions(preds, "sequence_kmer_glm", fold$name)
+}
+```
+
+```{r Sequence k-mer RF, saved}
+# Full VDJ sequence 7-mers instead of junction-only.
+# Same recipe structure as junction k-mer RF.
+
+for (fold in outer_folds) {
+  train_samp <- slice_sample(fold$train_ann, n = 200000, replace = FALSE)
+
+  kmer_recipe <-
+    recipe(Disease ~ sequence + weight, data = train_samp) %>%
+    step_tokenize(sequence, token = 'characters') %>%
+    step_ngram(sequence, min_num_tokens = 7, num_tokens = 7) %>%
+    step_tokenfilter(sequence, min_times = 100, max_tokens = 5000) %>%
+    step_tfidf(sequence) %>%
+    step_nzv(all_predictors()) %>%
+    step_downsample(Disease)
+
+  rf_fit <-
+    workflow() %>%
+    add_recipe(kmer_recipe) %>%
+    add_model(
+      rand_forest(trees = 500, min_n = 5) %>%
+        set_engine("ranger", num.threads = 8) %>%
+        set_mode("classification")
+    ) %>%
+    add_case_weights(weight) %>%
+    fit(train_samp)
+
+  preds <- make_predictions(rf_fit, fold$test_ann)
+  save_predictions(preds, "sequence_kmer_rf", fold$name)
+}
+```
+
+```{r Junction protein features — featurize}
+# junction_aa is the direct codon-table translation of the junction nt sequence.
+# Sample 100k from each split before featurization — running protr on 1.3M rows
+# is too slow; 100k is sufficient for a comparator model.
+# train_jprot / test_jprot are then used directly in the fold loop below.
+
+train_jprot <- featurize_protein(
+  slice_sample(train_ann, n = 200000, replace = FALSE),
+  "junction_aa", min_len = 5, extractor = extract_features_junction)
+test_jprot  <- featurize_protein(
+  slice_sample(test_ann, n = 200000, replace = FALSE),
+  "junction_aa", min_len = 5, extractor = extract_features_junction)
+
+cat("Junction protein rows — train:", nrow(train_jprot), " test:", nrow(test_jprot), "\n")
+stopifnot(!any(is.na(train_jprot$Disease)))
+stopifnot(!any(is.na(test_jprot$Disease)))
+```
+
+```{r Junction protein GLM, saved}
+for (fold in outer_folds) {
+  # Pick matching featurized frame based on fold direction
+  tr <- if (fold$name == "unflipped") train_jprot else test_jprot
+  te <- if (fold$name == "unflipped") test_jprot  else train_jprot
+
+  train_samp <- tr %>%
+    #slice_sample(n = min(100000, nrow(tr)), replace = FALSE) %>%
+    select(starts_with("features_"), Disease, weight, Author, Subject, true_label)
+
+  prot_recipe <-
+    recipe(Disease ~ ., data = train_samp) %>%
+    update_role(true_label, Author, Subject, new_role = "ID") %>%
+    step_zv(all_predictors()) %>%
+    step_corr(all_numeric_predictors(), threshold = 0.95) %>%
+    step_downsample(Disease)
+
+  prot_fit <-
+    workflow() %>%
+    add_recipe(prot_recipe) %>%
+    add_model(logistic_reg(penalty = 0.01, mixture = 1) %>% set_engine("glmnet")) %>%
+    add_case_weights(weight) %>%
+    fit(train_samp)
+
+  preds <- make_predictions(prot_fit, te)
+  save_predictions(preds, "junction_protein_glm", fold$name)
+}
+```
+
+```{r Junction protein RF, saved}
+for (fold in outer_folds) {
+  tr <- if (fold$name == "unflipped") train_jprot else test_jprot
+  te <- if (fold$name == "unflipped") test_jprot  else train_jprot
+
+  train_samp <- tr %>%
+    #slice_sample(n = min(100000, nrow(tr)), replace = FALSE) %>%
+    select(starts_with("features_"), Disease, weight, Author, Subject, true_label)
+
+  prot_recipe <-
+    recipe(Disease ~ ., data = train_samp) %>%
+    update_role(true_label, Author, Subject, new_role = "ID") %>%
+    step_zv(all_predictors()) %>%
+    step_corr(all_numeric_predictors(), threshold = 0.95) %>%
+    step_downsample(Disease)
+
+  rf_fit <-
+    workflow() %>%
+    add_recipe(prot_recipe) %>%
+    add_model(
+      rand_forest(trees = 500, min_n = 5) %>%
+        set_engine("ranger", num.threads = 8) %>%
+        set_mode("classification")
+    ) %>%
+    add_case_weights(weight) %>%
+    fit(train_samp)
+
+  preds <- make_predictions(rf_fit, te)
+  save_predictions(preds, "junction_protein_rf", fold$name)
+}
+```
+
+```{r Complete VDJ protein features — featurize}
+# sequence_aa is the direct codon-table translation of the v_start–j_end
+# clipped nucleotide sequence.  Sequences are productive and in-frame at
+# position 1, so the translation is correct without alignment.
+
+train_vprot <- featurize_protein(
+  slice_sample(train_ann, n = 200000, replace = FALSE),
+  "sequence_aa", min_len = 15, extractor = extract_features_vdj)
+test_vprot  <- featurize_protein(
+  slice_sample(test_ann, n = 200000, replace = FALSE),
+  "sequence_aa", min_len = 15, extractor = extract_features_vdj)
+
+cat("VDJ protein rows — train:", nrow(train_vprot), " test:", nrow(test_vprot), "\n")
+stopifnot(!any(is.na(train_vprot$Disease)))
+stopifnot(!any(is.na(test_vprot$Disease)))
+```
+
+```{r Complete VDJ protein GLM}
+for (fold in outer_folds) {
+  tr <- if (fold$name == "unflipped") train_vprot else test_vprot
+  te <- if (fold$name == "unflipped") test_vprot  else train_vprot
+
+  train_samp <- tr %>%
+    #slice_sample(n = min(100000, nrow(tr)), replace = FALSE) %>%
+    select(starts_with("features_"), Disease, weight, Author, Subject, true_label)
+
+  prot_recipe <-
+    recipe(Disease ~ ., data = train_samp) %>%
+    update_role(true_label, Author, Subject, new_role = "ID") %>%
+    step_zv(all_predictors()) %>%
+    step_corr(all_numeric_predictors(), threshold = 0.95) %>%
+    step_downsample(Disease)
+
+  prot_fit <-
+    workflow() %>%
+    add_recipe(prot_recipe) %>%
+    add_model(logistic_reg(penalty = 0.01, mixture = 1) %>% set_engine("glmnet")) %>%
+    add_case_weights(weight) %>%
+    fit(train_samp)
+
+  preds <- make_predictions(prot_fit, te)
+  save_predictions(preds, "vdj_protein_glm", fold$name)
+}
+```
+
+```{r Complete VDJ protein RF}
+for (fold in outer_folds) {
+  tr <- if (fold$name == "unflipped") train_vprot else test_vprot
+  te <- if (fold$name == "unflipped") test_vprot  else train_vprot
+
+  train_samp <- tr %>%
+    #slice_sample(n = min(100000, nrow(tr)), replace = FALSE) %>%
+    select(starts_with("features_"), Disease, weight, Author, Subject, true_label)
+
+  prot_recipe <-
+    recipe(Disease ~ ., data = train_samp) %>%
+    update_role(true_label, Author, Subject, new_role = "ID") %>%
+    step_zv(all_predictors()) %>%
+    step_corr(all_numeric_predictors(), threshold = 0.95) %>%
+    step_downsample(Disease)
+
+  rf_fit <-
+    workflow() %>%
+    add_recipe(prot_recipe) %>%
+    add_model(
+      rand_forest(trees = 500, min_n = 5) %>%
+        set_engine("ranger", num.threads = 8) %>%
+        set_mode("classification")
+    ) %>%
+    add_case_weights(weight) %>%
+    fit(train_samp)
+
+  preds <- make_predictions(rf_fit, te)
+  save_predictions(preds, "vdj_protein_rf", fold$name)
+}
+```
+

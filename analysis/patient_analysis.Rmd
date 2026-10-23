@@ -1,0 +1,174 @@
+---
+title: "Patient-level disease state analysis"
+---
+
+```{r setup}
+source(here::here("R", "paths.R"))
+source(here::here("R", "exclusions.R"))
+source(here::here("R", "metadata.R"))
+library(tidyverse)
+library(vroom)
+library(readxl)
+library(patchwork)
+library(ggbeeswarm)
+
+FIGURES_DIR <- out_path("figures")
+dir.create(FIGURES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+BASE         <- out_path("sequence-classifier")
+METADATA_XLS <- data_path("metadata/2024-SRARunTable-MetadataCleaning.xlsx")
+TRAIN_W      <- data_path("classifier/classifier_data_igblast-train-weights.csv")
+TEST_W       <- data_path("classifier/classifier_data_igblast-test-weights.csv")
+```
+
+```{r load-ensemble-with-metadata}
+# Load ensemble predictions and join with the weights CSV on row index.
+# This brings in BSource, consensus_count, and weight alongside per-sequence scores.
+load_ensemble_patient <- function(dir, model_label, train_weights, test_weights) {
+  join_by_row <- function(preds_csv, weights_df) {
+    preds <- read_csv(preds_csv, show_col_types = FALSE) %>%
+      mutate(.row_idx = row_number())
+    wt <- weights_df %>% mutate(.row_idx = row_number()) %>% select(-Disease)
+
+    joined <- inner_join(preds, wt, by = ".row_idx", suffix = c("", "_wt"))
+    stopifnot(all(joined$Author == joined$Author_wt))
+    joined %>% select(-.row_idx, -ends_with("_wt"))
+  }
+
+  unflipped <- join_by_row(
+    file.path(dir, "unflipped/predictions/ensemble_predictions.csv"),
+    test_weights
+  )
+  flipped <- join_by_row(
+    file.path(dir, "flipped/predictions/ensemble_predictions.csv"),
+    train_weights
+  )
+
+  bind_rows(unflipped, flipped) %>%
+    rename(
+      prob_ms   = ms_score,
+      Predicted = predicted_class,
+      Disease   = true_label
+    ) %>%
+    mutate(model = model_label)
+}
+
+train_w <- vroom(TRAIN_W, show_col_types = FALSE)
+test_w  <- vroom(TEST_W,  show_col_types = FALSE)
+
+ENSEMBLE_DIRS <- list(
+  "LM Exclusion AUGC" = file.path(BASE, "ensemble-output-exclusion"),
+  "LM Baseline AUGC"  = file.path(BASE, "ensemble-output-baseline")
+)
+
+seq_preds <-
+  imap(ENSEMBLE_DIRS, \(dir, lab) load_ensemble_patient(dir, lab, train_w, test_w)) %>%
+  reduce(bind_rows) %>%
+  # Remove small problematic datasets
+  filter(Author != "PRJNA248475", Author != "PRJNA248411", Author != "PRJNA866296") %>%
+  drop_duplicate_repertoires("Author", "Subject")   # R/exclusions.R
+```
+
+```{r load-sra-metadata}
+# Re-join patient-level metadata dropped at dataset build time.
+# Disease Class, EDSS, Patient State are patient-level — safe to join on Subject.
+# Treatment is run-level and NOT recoverable here.
+sra_meta <- read_metadata(METADATA_XLS) %>%
+  select(BioProject, Age, Sex, DonorID,
+         Disease_Class = `Disease Class`,
+         Patient_State = `Patient State`,
+         EDSS,
+         Years_disease = `Years disease`) %>%
+  mutate(Subject = paste(Age, Sex, DonorID)) %>%
+  distinct(BioProject, Subject, .keep_all = TRUE) %>%
+  select(-Age, -Sex, -DonorID)
+
+seq_preds <- seq_preds %>%
+  left_join(sra_meta, by = c("Author" = "BioProject", "Subject"))
+
+# How many MS patients have Disease_Class?
+seq_preds %>%
+  filter(Disease == "Multiple sclerosis") %>%
+  distinct(Author, Subject, Disease_Class) %>%
+  count(Disease_Class, sort = TRUE)
+```
+
+```{r patient-aggregation}
+# Weighted percentile via sorted cumulative weights (mirrors Python summarize_patients.py)
+weighted_percentile <- function(scores, weights, p) {
+  if (length(scores) == 1L) return(scores)
+  idx           <- order(scores)
+  sorted_scores <- scores[idx]
+  cum_w         <- cumsum(as.numeric(weights[idx]))
+  cum_w         <- cum_w / cum_w[length(cum_w)]
+  approx(cum_w, sorted_scores, xout = p / 100, rule = 2)$y
+}
+
+# Aggregate to patient × tissue × model.
+# ms_score_90pct = consensus-count-weighted 95th percentile of per-sequence MS scores (the 95th, as in
+#   the Fig. 3A/3C legends; the name is historical).
+# ms_score_median = consensus-count-weighted median of per-sequence MS scores.
+patient_preds <- seq_preds %>%
+  group_by(model, Author, Subject, BSource, Disease, Disease_Class,
+           Patient_State, EDSS, Years_disease) %>%
+  summarize(
+    ms_score_90pct  = weighted_percentile(prob_ms, consensus_count, 95),
+    ms_score_median = weighted_percentile(prob_ms, consensus_count, 50),
+    n_seqs          = n(),
+    .groups         = "drop"
+  )
+
+patient_preds %>%
+  count(model, Disease, BSource)
+```
+
+```{r disease-class-plot}
+CLASS_ORDER <- c("CIS","RRMS", "PPMS", "SPMS")
+
+patient_preds %>%
+  filter(
+    Disease       == "Multiple sclerosis",
+    BSource       == "Blood",
+    Disease_Class %in% CLASS_ORDER,
+    model         == "LM Exclusion AUGC"
+  ) %>%
+  mutate(Disease_Class = factor(Disease_Class, levels = CLASS_ORDER)) %>%
+  ggplot(aes(x = Disease_Class, y = ms_score_90pct, colour = Disease_Class)) +
+  geom_boxplot(outlier.shape = NA, notch = F) +
+  geom_beeswarm(alpha = 0.6, cex = 0.8) +
+  scale_colour_viridis_d() +
+  theme_linedraw(base_size = 10) +
+  theme(legend.position = "none", panel.grid = element_blank(), aspect.ratio = 1) +
+  labs(
+    x     = NULL,
+    y     = "MS score (95th pct, weighted)",
+    title = "MS disease class: patient-level score (Blood)"
+  ) -> p_disease_class
+p_disease_class
+ggsave(file.path(FIGURES_DIR, "fig3C_patient_disease_class.svg"), p_disease_class, width = 2.5, height = 2)
+```
+
+```{r model-comparison}
+# Compare both models side by side for MS patients in Blood
+patient_preds %>%
+  filter(
+    Disease == "Multiple sclerosis",
+    BSource == "Blood"
+  ) %>%
+  ggplot(aes(x = model, y = ms_score_90pct, colour = model)) +
+  geom_boxplot(outlier.shape = NA, notch = T) +
+  geom_beeswarm(alpha = 0.5) +
+  scale_colour_viridis_d() +
+  theme_linedraw(base_size = 10) +
+  theme(
+    aspect.ratio = 1,
+    legend.position = "none",
+    panel.grid      = element_blank(),
+    axis.text.x     = element_text(angle = 30, hjust = 1)
+  ) +
+  labs(x = NULL, y = "MS score (95th pct, weighted)", title = "Model comparison — MS patients (Blood)") -> p_model_comp
+p_model_comp
+ggsave(file.path(FIGURES_DIR, "fig3A_patient_model_comparison.svg"), p_model_comp, width = 2.5, height = 2)
+```
+
+

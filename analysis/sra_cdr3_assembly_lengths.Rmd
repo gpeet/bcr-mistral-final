@@ -1,0 +1,119 @@
+---
+title: "SRA TRUST4 — CDR3 & Assembly Length Distributions"
+---
+
+```{r setup, include=FALSE}
+source(here::here("R", "paths.R"))
+source(here::here("R", "exclusions.R"))
+source(here::here("R", "trust4_files.R"))
+source(here::here("R", "metadata.R"))
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(readxl)
+library(vroom)
+library(ggrepel)
+
+TRUST4_DIR  <- data_path("trust4/TRUST4results")
+METADATA_XL <- data_path("metadata/2024-SRARunTable-MetadataCleaning.xlsx")
+FIGURES_DIR <- out_path("figures")
+dir.create(FIGURES_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+## 1. Load Metadata
+
+```{r load-metadata}
+metadata <- read_metadata(METADATA_XL) %>%
+  select(Run, BioProject, create_date, Tissue, `Cell Type`, Age, Sex,
+         Disease, `Disease Class`, DonorID, Treatment, `Patient State`,
+         EDSS, `Years disease`)
+```
+
+## 2. CDR3 (Junction) Length
+
+```{r junction-length-data}
+# One AIRR file per SRA run (R/trust4_files.R); SRA runs only (in-house files carry no accession)
+all_files  <- list.files(TRUST4_DIR, full.names = TRUE, pattern = "airr\\.tsv$")
+kept_files <- keep_one_file_per_run(all_files)
+cat(sprintf("%d extra files left out: %s\n", length(all_files) - length(kept_files),
+            paste(basename(setdiff(all_files, kept_files)), collapse = ", ")))
+airr_files <- tibble(path = kept_files) %>%
+  mutate(SRA = str_extract(basename(path), "(SRR|ERR)[0-9]+")) %>%
+  filter(!is.na(SRA))
+
+junction_raw <- map2(airr_files$path, airr_files$SRA,
+                     ~ vroom(.x, col_select = c("junction_aa", "v_call"), show_col_types = FALSE) %>%
+                         mutate(SRA = .y))
+
+filtering <- junction_raw %>%
+  map(filter, str_starts(v_call, "IGH")) %>%
+  map(left_join, metadata, by = c("SRA" = "Run")) %>%
+  data.table::rbindlist() %>%
+  as_tibble() %>%
+  select(BioProject, Disease, `Disease Class`, Age, Sex, DonorID,
+         Tissue, `Cell Type`, v_call, junction_aa) %>%
+  drop_duplicate_repertoires("BioProject", "DonorID")   # duplicated repertoires (R/exclusions.R)
+
+rm(junction_raw)
+gc()
+
+head(filtering)
+```
+
+## 3. CDR3 Length — Distribution Plot
+
+```{r junction-length-plot}
+plot_data <- filtering %>%
+  filter(!is.na(Disease), Tissue %in% c("Blood", "CSF")) %>%
+  mutate(
+    Disease        = fct_lump(Disease, n = 1, other_level = "Controls"),
+    junction_length = str_length(junction_aa)
+  ) %>%
+  filter(!is.na(junction_length), between(junction_length, 10, 30))
+
+p_cdr3_density <- ggplot(plot_data, aes(x = junction_length, fill = Disease)) +
+  geom_density(alpha = 0.8, adjust = 5) +
+  facet_grid(rows = vars(Tissue)) +
+  scale_fill_viridis_d(option = "inferno") +
+  theme_linedraw(base_size = 14) +
+  theme(aspect.ratio = 2, panel.grid = element_blank()) +
+  labs(x = "CDR3 Length (aa)", y = "Normalized Density",
+       title = "IGH CDR3 length distribution: MS vs Controls")
+
+p_cdr3_density
+ggsave(file.path(FIGURES_DIR, "fig1I_cdr3_length_density.svg"),
+       p_cdr3_density, width = 4, height = 6)
+```
+
+## 4. Significance Test — CDR3 Length
+
+```{r}
+
+plot_data %>%
+  group_by(Tissue) %>%
+  group_map(function(df, key) {
+    ms  <- df %>% filter(Disease == levels(df$Disease)[1]) %>% pull(junction_length)
+    ctl <- df %>% filter(Disease == "Controls") %>% pull(junction_length)
+    wt  <- t.test(ms, ctl)
+    tibble(
+      Tissue       = key$Tissue,
+      n_MS         = length(ms),
+      n_Controls   = length(ctl),
+      mean_MS    = mean(ms),
+      mean_Ctrl  = mean(ctl),
+      t            = wt$statistic,
+      p_value      = wt$p.value
+    )
+  }) %>%
+  bind_rows() %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH"),
+         sig   = case_when(
+           p_adj < 0.001 ~ "***",
+           p_adj < 0.01  ~ "**",
+           p_adj < 0.05  ~ "*",
+           TRUE          ~ "ns"
+         )) -> cdr3_tests
+cdr3_tests
+write_csv(cdr3_tests, file.path(FIGURES_DIR, "fig1I_cdr3_length_tests.csv"))
+```
+

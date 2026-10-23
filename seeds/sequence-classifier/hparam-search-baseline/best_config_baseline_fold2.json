@@ -1,0 +1,21 @@
+{
+  "fold": "fold2",
+  "best_trial": 52,
+  "best_augc": 0.06367385387420654,
+  "params": {
+    "n_layers": 3,
+    "first_width": 115,
+    "width_decay": 0.5873419064755916,
+    "dropout": 0.4105553566031752,
+    "input_dropout": 0.4070552585656278,
+    "lr": 0.000990570312059781,
+    "weight_decay": 0.0877019596464865,
+    "label_smoothing": 0.07217303235508896
+  },
+  "n_params": 304578,
+  "hidden_dims": [
+    256,
+    128,
+    64
+  ]
+}

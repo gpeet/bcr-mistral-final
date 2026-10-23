@@ -1,0 +1,209 @@
+---
+title: "V Gene Enrichment in Classifier-Predicted MS Sequences — Figure 3"
+---
+
+```{r setup, include=FALSE}
+source(here::here("R", "paths.R"))
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(vroom)
+library(patchwork)
+
+FIGURES_DIR <- out_path("figures")
+dir.create(FIGURES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+BASE           <- out_path("sequence-classifier")
+ENSEMBLE_DIR   <- file.path(BASE, "ensemble-output-exclusion")
+PRED_UNFLIPPED <- file.path(ENSEMBLE_DIR, "unflipped/predictions/ensemble_predictions.csv")
+PRED_FLIPPED   <- file.path(ENSEMBLE_DIR, "flipped/predictions/ensemble_predictions.csv")
+TRAIN_W        <- data_path("classifier/classifier_data_igblast-train-weights.csv")
+TEST_W         <- data_path("classifier/classifier_data_igblast-test-weights.csv")
+```
+
+## 1. Load Fold-Aware Predictions + V Gene Annotations
+
+Fold-aware join: unflipped predictions ↔ test weights, flipped predictions ↔ train
+weights. The row-aligned join brings `v_call` from the weights CSV alongside
+`ms_score` from the prediction CSV.
+
+```{r load-fold-aware-data}
+join_by_row <- function(preds_csv, weights_df) {
+  preds <- read_csv(preds_csv, show_col_types = FALSE) %>%
+    mutate(.row_idx = row_number())
+  wt <- weights_df %>% mutate(.row_idx = row_number())
+
+  joined <- inner_join(preds, wt, by = ".row_idx", suffix = c("", "_wt"))
+  stopifnot(all(joined$Author == joined$Author_wt))
+  joined %>% select(-.row_idx, -ends_with("_wt"))
+}
+
+train_w <- vroom(TRAIN_W, show_col_types = FALSE)
+test_w  <- vroom(TEST_W,  show_col_types = FALSE)
+
+# Unflipped models trained on train, predict test; flipped vice versa
+unflipped <- join_by_row(PRED_UNFLIPPED, test_w)
+flipped   <- join_by_row(PRED_FLIPPED,   train_w)
+
+seq_data <- bind_rows(unflipped, flipped) %>%
+  # Exclude problematic BioProjects; PRJNA866296 repeats patients of PRJNA684320 (as in the other analyses)
+  filter(Author != "PRJNA248475", Author != "PRJNA248411", Author != "PRJNA866296") %>%
+  # Exclude MS twins
+  filter(!str_detect(Subject, "Twin(?:1|2|3|4)\\.2"),
+         !str_detect(Subject, "SCNI"))
+
+cat("Total sequences:", scales::comma(nrow(seq_data)), "\n")
+cat("Disease distribution:\n")
+print(table(seq_data$true_label))
+```
+
+## 2. Prepare V Gene Data
+
+Truncate allele-level calls to gene level (IGHV4-34*01 → IGHV4-34) and define
+MS-associated vs background based on the classifier's ms_score threshold.
+
+```{r prepare-v-gene-data}
+seq_data <- seq_data %>%
+  mutate(
+    v_call_gene  = str_remove(v_call, "\\*.*"),
+    ms_associated = ms_score > 0.5
+  )
+
+# Count V gene occurrences and filter to ≥ 50
+v_gene_counts <- seq_data %>%
+  count(v_call_gene, name = "total_n") %>%
+  filter(total_n >= 50)
+
+seq_filtered <- seq_data %>%
+  filter(v_call_gene %in% v_gene_counts$v_call_gene)
+
+cat("V genes with ≥ 50 occurrences:", nrow(v_gene_counts), "\n")
+cat("Sequences retained:", scales::comma(nrow(seq_filtered)), "\n")
+cat("MS-associated sequences:", scales::comma(sum(seq_filtered$ms_associated)), "\n")
+cat("Background sequences:", scales::comma(sum(!seq_filtered$ms_associated)), "\n")
+```
+
+## 3. Fisher's Exact Tests
+
+For each V gene, test whether it is enriched or depleted among MS-associated
+sequences relative to all other V genes.
+
+```{r fisher-exact-tests}
+# Global counts
+total_ms_yes <- sum(seq_filtered$ms_associated)
+total_ms_no  <- sum(!seq_filtered$ms_associated)
+
+# Per-gene counts
+per_gene <- seq_filtered %>%
+  count(v_call_gene, ms_associated) %>%
+  pivot_wider(names_from = ms_associated, values_from = n, values_fill = 0) %>%
+  rename(ms_yes = `TRUE`, ms_no = `FALSE`) 
+
+# Fisher's exact test per V gene
+fisher_results <- per_gene %>%
+  rowwise() %>%
+  mutate(
+    test = list(fisher.test(matrix(
+      c(ms_yes, total_ms_yes - ms_yes, ms_no, total_ms_no - ms_no),
+      nrow = 2
+    ))),
+    OR       = test$estimate,
+    p_value  = test$p.value,
+    ci_low   = test$conf.int[1],
+    ci_high  = test$conf.int[2]
+  ) %>%
+  ungroup() %>%
+  select(-test) %>%
+  mutate(
+    p_adj      = p.adjust(p_value, method = "BH"),
+    log2_OR    = log2(OR),
+    log2_ci_lo = log2(ci_low),
+    log2_ci_hi = log2(ci_high),
+    significant = p_adj < 0.01,
+    total_n    = ms_yes + ms_no
+  ) %>%
+  arrange(p_adj)
+
+dir.create(out_path("sequence-classifier/intermediates"), showWarnings = FALSE, recursive = TRUE)
+write_csv(fisher_results, out_path("sequence-classifier/intermediates/fig2G_vgene_fisher.csv"))
+cat("Significant V genes (FDR < 0.01):", sum(fisher_results$significant), "\n\n")
+print(fisher_results %>% select(v_call_gene, total_n, log2_OR, p_adj, significant) %>%
+        head(20))
+```
+
+## 4. Forest Plot
+
+```{r forest-plot, fig.width=8, fig.height=10}
+# Fig 2G shows the most significant V genes: the 30 published ones are exactly those whose
+# adjusted p-value underflows to 0 (< 1e-300); the next is IGHV1-58 at 2.6e-255
+TOP_N_FOREST <- 30
+p_vgene_forest <- fisher_results %>%
+  slice_min(p_adj, n = TOP_N_FOREST) %>%
+  mutate(v_call_gene = fct_reorder(v_call_gene, OR)) %>%
+  ggplot(aes(x = OR, y = v_call_gene, colour = significant)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_point(size = 2) +
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.25) +
+  scale_x_log10() +
+  scale_colour_viridis_d(
+    labels = c("TRUE" = "FDR < 0.01", "FALSE" = "NS"),
+    direction = -1
+  ) +
+  theme_linedraw(base_size = 10) +
+  theme(panel.grid = element_blank()) +
+  labs(
+    x      = "Odds Ratio (log scale)",
+    y      = NULL,
+    colour = "Significance",
+    title  = "V gene enrichment in MS-associated sequences",
+    subtitle = "Fisher's exact test per V gene, BH-corrected"
+  )
+p_vgene_forest
+ggsave(file.path(FIGURES_DIR, "fig2G_vgene_enrichment_forest.svg"), p_vgene_forest, width = 3, height = 4)
+```
+
+## 5. Stacked Bar Chart — Top 15 V Genes
+
+```{r stacked-bar-chart, fig.width=3, fig.height=3}
+top15 <- seq_filtered %>%
+  count(v_call_gene, sort = TRUE) %>%
+  slice_head(n = 15) %>%
+  pull(v_call_gene)
+
+# Compute per-gene MS-associated prevalence and sort by it (ascending so highest is at top after coord_flip)
+ms_prev_order <- seq_filtered %>%
+  filter(v_call_gene %in% top15) %>%
+  count(v_call_gene, ms_associated) %>%
+  group_by(v_call_gene) %>%
+  mutate(freq = n / sum(n)) %>%
+  ungroup() %>%
+  filter(ms_associated) %>%
+  arrange(freq) %>%
+  pull(v_call_gene)
+
+p_vgene_bar <- seq_filtered %>%
+  filter(v_call_gene %in% top15) %>%
+  count(v_call_gene, ms_associated) %>%
+  group_by(v_call_gene) %>%
+  mutate(freq = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(
+    v_call_gene = factor(v_call_gene, levels = ms_prev_order),
+    group = if_else(ms_associated, "MS-associated", "Background")
+  ) %>%
+  ggplot(aes(x = v_call_gene, y = freq, fill = group)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  scale_fill_viridis_d() +
+  scale_y_continuous(labels = scales::percent) +
+  theme_linedraw(base_size = 10) +
+  theme(panel.grid = element_blank()) +
+  labs(
+    x     = NULL,
+    y     = "Share of the V gene's sequences",   # freq is computed within each V gene
+    fill  = NULL,
+    title = "V gene frequency: MS-associated vs background (top 15)"
+  )
+p_vgene_bar
+ggsave(file.path(FIGURES_DIR, "fig2H_vgene_frequency_top15.svg"), p_vgene_bar, width = 3, height = 2.5)
+```

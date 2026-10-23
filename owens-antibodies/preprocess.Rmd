@@ -1,0 +1,76 @@
+---
+title: "Preprocess Owens BCR sequences"
+---
+
+```{r setup}
+source(here::here("R", "paths.R"))
+library(tidyverse)
+library(Biostrings)
+library(igblastr)
+
+FASTA_DIR <- data_path("owens/MS Repertoire Fasta Files")
+OUT_CSV   <- data_path("owens/owens_sequences.csv")
+```
+
+```{r read-fasta}
+fasta_files <- list.files(FASTA_DIR, pattern = "\\.fa$",
+                          full.names = TRUE, recursive = TRUE)
+
+cat(sprintf("Found %d FASTA files\n", length(fasta_files)))
+
+read_fasta_to_tibble <- function(f) {
+  fa <- readDNAStringSet(f)
+  tibble(
+    file = str_remove(f, fixed(paste0(FASTA_DIR, "/"))),  # relative to the FASTA folder
+    header = names(fa),
+    sequence = as.character(fa)
+  )
+}
+
+all_sequences <- map_dfr(fasta_files, read_fasta_to_tibble)
+cat(sprintf("Total sequences: %s\n", scales::comma(nrow(all_sequences))))
+```
+
+```{r igblast}
+use_germline_db("IMGT-202531-1.Homo_sapiens.IGH+IGK+IGL")
+use_c_region_db("_IMGT.human.IGH+IGK+IGL.202412")
+
+seqs <- DNAStringSet(all_sequences$sequence)
+
+igblast_results <- igblastn(
+  query = seqs,
+  organism = "human",
+  outfmt = "AIRR"
+)
+
+annotated <- all_sequences %>%
+  dplyr::rename(original_sequence = sequence) %>%
+  bind_cols(igblast_results)
+
+cat(sprintf("Annotated: %s sequences\n", scales::comma(nrow(annotated))))
+annotated %>% count(locus, sort = TRUE)
+```
+
+```{r filter-and-clip}
+# V-J clip and filter to match the main classifier pipeline
+owens <- annotated %>%
+  filter(productive == TRUE) %>%
+  filter(str_starts(v_call, "IGH")) %>%
+  mutate(sequence = str_sub(sequence, v_sequence_start, j_sequence_end)) %>%
+  filter(str_count(sequence, "N") < 1) %>%
+  select(sequence_id, file, header, locus,
+         v_call, d_call, j_call, c_call,
+         junction, sequence,
+         productive, complete_vdj)
+
+cat(sprintf("After filtering: %d productive IGH sequences (V-J clipped, no N's)\n",
+            nrow(owens)))
+
+owens %>% count(complete_vdj)
+
+```
+
+```{r write-output}
+write_csv(owens, OUT_CSV)
+cat(sprintf("Written to %s\n", OUT_CSV))
+```

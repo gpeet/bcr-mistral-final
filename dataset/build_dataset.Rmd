@@ -1,0 +1,356 @@
+---
+title: "Build the labelled classifier dataset"
+---
+
+```{r}
+source(here::here("R", "paths.R"))
+source(here::here("R", "metadata.R"))
+library(tidyverse)
+library(tidymodels)
+library(vroom)
+library(readxl)
+
+# Master TRUST4 table built by `workflow/run.sh master-trust4` (dataset/07_master_trust4.sh).
+# This is the full table; every read below keeps only IGH rows, so it is equivalent to the
+# IGH-only extract (`--chains IGH`). Column types are pinned so that type guessing on the first
+# rows cannot mistype c_call or the T/F flags.
+TRUST4_CSV <- data_path("sequences/master-trust4-dataset-sequence-unfiltered.csv")
+TRUST4_COLS <- cols_only(sequence = "c", productive = "l", complete_vdj = "l", junction = "c",
+                         consensus_count = "d", v_call = "c", c_call = "c", file_name = "c")
+IGBLAST_THREADS <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "14"))
+
+# Where the rebuilt files go. By default under BCRM_OUT/dataset/ (same relative paths), so a
+# rebuild never overwrites the released files in BCRM_DATA; BCRM_REBUILD_DATA=1 writes them into
+# BCRM_DATA, where the later stages read them. build_treatment_dataset.Rmd uses the same rule.
+build_path <- function(rel) {
+  p <- if (Sys.getenv("BCRM_REBUILD_DATA") == "1") data_path(rel) else out_path(file.path("dataset", rel))
+  dir.create(dirname(p), recursive = TRUE, showWarnings = FALSE)
+  p
+}
+
+# The sampling below is seeded, so a rebuild is reproducible. The released tables were drawn
+# before seeding and so will not match a rebuild row for row; they remain the default inputs.
+# Subjects with fewer than the sample size are unaffected.
+SEED <- 8675309
+```
+
+```{r Read and filter OPIG metadata}
+
+read_csv(data_path("metadata/allOPIGdefinedUnpairedMetadata.csv")) %>%
+  filter(Vaccine == 'None') %>%
+  filter(Disease %in% c('CMV','Dengue','EBV','HCV','HIV','Light-Chain-Amyloidosis','MuSK-MG','None','POEMS','SARS-COV-2','SLE','CLL','Ebola','AChR-MG')) %>%
+  mutate(Disease = if_else(Disease == 'None', 'Healthy', Disease)) %>% #prevent pandas issues
+  mutate(Year = as.numeric(str_extract(Author, "\\d{4}"))) %>%
+  group_by(Disease) %>%
+  ungroup() %>%
+  select(file_name, Author, Year, Age, BSource, BType, Disease, Subject, Isotype) -> df
+
+```
+
+
+```{r Add class weights and Bennett to full dataset, remove other category}
+# Class weight is 1 for blood, 2 for CSF, and 3 for brain
+# Multiplied by 1/v_identity * 2
+# Add bennett data in, hold together for split
+# Remove other category
+
+read_csv(data_path("metadata/allOPIGdefinedUnpairedMetadata.csv")) %>%
+  filter(Disease %in% c('CMV','Dengue','EBV','HCV','HIV','MuSK-MG','None','SARS-COV-2','SLE','Ebola','AChR-MG','MS')) %>%
+  mutate(Disease = if_else(Disease %in% c('CMV','Dengue','EBV','HCV','HIV','SARS-COV-2','Ebola'), "Infectious Disease", Disease)) %>%
+  mutate(Disease = if_else(Disease %in% c('MuSK-MG','SLE','AChR-MG'), "Autoimmune Disease", Disease)) %>%
+  mutate(Disease = if_else(Disease %in% c('MS'), "Multiple sclerosis", Disease)) %>%
+  mutate(Disease = if_else(Disease == 'None', 'Healthy', Disease)) %>% #prevent pandas issues
+  mutate(Year = as.numeric(str_extract(Author, "\\d{4}"))) %>%
+  ungroup() %>%
+  select(file_name, Author, Year, Age, BSource, BType, Disease, Subject, Isotype) -> df
+
+opig <-
+  vroom(data_path("sequences/master-opig-dataset-sequence.csv")) %>%
+  select(file_name, v_call, sequence, junction, consensus_count, productive, complete_vdj) %>%
+  filter(productive == T) %>%
+  filter(complete_vdj == T) %>%
+  filter(str_starts(v_call, "IGH")) %>%
+  right_join(df, by = 'file_name') %>%
+  filter(!is.na(sequence), !is.na(Disease), !is.na(junction), !is.na(Author))
+
+# Filter starting dataset
+set.seed(SEED)
+opig %>%
+  group_by(Author, Subject) %>%
+  slice_sample(n = 10000, replace = F) %>%
+  ungroup() %>%
+  select(Author, Year, Disease, Subject, Age, BSource, BType, Isotype, sequence, junction, consensus_count) %>%
+  write_csv(build_path("sequences/all_high_quality_for_igblast.csv"), append = F)
+
+####################
+read_metadata() %>%
+  select(Run, BioProject, create_date, Tissue, `Cell Type`, Age, Sex, DonorID, Disease, `Disease Class`, Treatment, `Patient State`, EDSS, `Years disease`) -> metadata
+
+trust4 <-
+  vroom(TRUST4_CSV, col_types = TRUST4_COLS) %>%
+  filter(productive == T) %>%
+  filter(complete_vdj == T) %>%
+  filter(str_starts(v_call, "IGH")) %>%
+  mutate(SRA = str_extract(file_name, "(SRR|ERR)[0-9]+")) %>%
+  left_join(metadata, by = c('SRA' = 'Run')) %>%
+  filter(!is.na(sequence), !is.na(Disease), !is.na(junction), !is.na(BioProject))
+
+# Filter starting dataset
+set.seed(SEED)
+trust4 %>%
+  mutate(Year = year(create_date)) %>%
+  mutate(Disease = if_else(Disease %in% c('Healthy','Control'), 'Healthy', Disease)) %>%
+  mutate(Disease = if_else(Disease %in% c('Sepsis','Viral encephalitis'), "Infectious Disease", Disease)) %>%
+  mutate(Disease = if_else(Disease %in% c('Type 1 Diabetes','Uveitis','Autoimmune encephalitis','Behcet\'s disease','NMO','Neurosarcoidosis'), "Autoimmune Disease", Disease)) %>%
+  filter(!Disease %in% c('Idiopathic intracranial hyertension','ALS')) %>% #drop old other category, only a handful of sequences
+  dplyr::rename(Author = BioProject) %>%
+  dplyr::rename(BSource = Tissue) %>%
+  dplyr::rename(BType = `Cell Type`) %>%
+  dplyr::rename(Isotype = c_call) %>%
+  mutate(Subject = paste(Age, Sex, DonorID)) %>%
+  mutate(Disease = if_else(str_detect(Subject, "Twin(?:1|2|3|4)\\.2"), "Multiple sclerosis", Disease)) %>% # recode MS twins to MS
+  mutate(Disease = if_else(str_detect(Subject, "SCNI"), "Multiple sclerosis", Disease)) %>% # recode MS twins to MS
+  group_by(Author, Subject, BSource, BType) %>%
+  slice_sample(n = 10000, replace = F) %>%
+  ungroup() %>%
+  select(Author, Year, Disease, Subject, Age, BSource, BType, Isotype, sequence, junction, consensus_count) %>%
+  write_csv(build_path("sequences/all_high_quality_for_igblast.csv"), append = T)
+
+####### Add Bennett data ####
+read_metadata() %>%
+  select(Run, BioProject, create_date, Tissue, `Cell Type`, Age, Sex, DonorID, Disease, `Disease Class`, Treatment, `Patient State`, EDSS, `Years disease`, Filename) %>%
+  filter(str_starts(BioProject, 'Bennett')) -> metadata
+
+trust4 <-
+  vroom(TRUST4_CSV, col_types = TRUST4_COLS) %>%
+  filter(str_starts(v_call, "IGH")) %>%
+  filter(complete_vdj == TRUE) %>%
+  filter(productive == TRUE) %>%
+  left_join(metadata, by = c('file_name' = 'Filename')) %>%
+  filter(str_starts(BioProject, 'Bennett')) %>%
+  filter(!is.na(sequence), !is.na(junction))
+
+set.seed(SEED)
+trust4 %>%
+  mutate(Year = year(create_date)) %>%
+  mutate(Disease = if_else(Disease %in% c('Healthy','Control'), 'Healthy', Disease)) %>%
+   mutate(Disease = if_else(Disease %in% c('Type 1 Diabetes','Uveitis','Autoimmune encephalitis','Behcet\'s disease','NMO'), "Autoimmune Disease", Disease)) %>%
+  dplyr::rename(Author = BioProject) %>%
+  dplyr::rename(BSource = Tissue) %>%
+  dplyr::rename(BType = `Cell Type`) %>%
+  dplyr::rename(Isotype = c_call) %>%
+  mutate(Subject = paste(Age, Sex, DonorID)) %>%
+  group_by(Author, Subject, BSource, BType) %>%
+  slice_sample(n = 10000, replace = F) %>%
+  select(Author, Year, Disease, Subject, Age, BSource, BType, Isotype, sequence, junction, consensus_count) %>%
+  write_csv(build_path("sequences/all_high_quality_for_igblast.csv"), append = T)
+
+##### Re-annotate all with igblastn #########
+hq <- read_csv(build_path("sequences/all_high_quality_for_igblast.csv"))
+
+# summary of how many were sampled per disease
+hq %>%
+  group_by(Disease) %>%
+  summarize(count = n())
+
+library(igblastr)
+#install_IMGT_germline_db('202531-1', force = T)
+use_germline_db("IMGT-202531-1.Homo_sapiens.IGH+IGK+IGL")
+use_c_region_db("_IMGT.human.IGH+IGK+IGL.202412")
+
+seqs <- DNAStringSet(hq$sequence)
+names(seqs) <- rep(1, nrow(hq))
+
+# Run igblastn
+igblast_results <- 
+  igblastn(
+  query = seqs,
+  organism = "human",
+  outfmt = "AIRR",
+  num_threads=IGBLAST_THREADS,
+  num_alignments_V=1,
+  num_alignments_C=1
+)
+
+##### clip v start through j end sequence #######
+hq %>%
+  select(Author, Year, Disease, Subject, Age, BSource, BType, consensus_count) %>%
+  bind_cols(igblast_results) %>%
+  filter(productive == T) %>%
+  filter(complete_vdj == T) %>%
+  filter(str_starts(v_call, "IGH")) %>%
+  mutate(sequence = str_sub(sequence, v_sequence_start, j_sequence_end)) %>%
+  filter(str_count(sequence, 'N') < 1) %>%
+  select(Author, Year, Disease, Subject, Age, BSource, BType, v_call, c_call, sequence, junction, consensus_count, v_identity) -> catch
+
+write_csv(catch, build_path("sequences/all_hq_igblast_realigned.csv"))
+catch <- read_csv(build_path("sequences/all_hq_igblast_realigned.csv"))
+
+catch %>%
+  filter(Author != 'PRJNA248475') %>%
+  filter(Author != 'PRJNA248411') %>%
+  mutate(BSource = if_else(BSource %in% c('Brain', 'Brain-Lesion', 'Cortex', 'Choroid-Plexus', 'Pia-Mater'), 'Brain', BSource)) %>%
+  mutate(BSource = if_else(BSource %in% c('Cerebrospinal-Fluid'), 'CSF', BSource)) %>%
+  mutate(weight = 1 * (BSource == 'CSF') + 3 * (BSource == 'Brain') + 1) -> catch #+ (100 / v_identity)
+
+# Seeded before the split, so the split does not depend on the sampling above
+set.seed(SEED)
+splits <-
+  catch %>%
+  group_initial_split(group = Author, prop = 0.5)
+
+training(splits) %>%
+  group_by(Disease, str_starts(Author, 'PRJ')) %>%
+  summarize(seqs = n(),
+            patients = length(unique(Subject)))
+
+testing(splits) %>%
+  group_by(Disease, str_starts(Author, 'PRJ')) %>%
+  summarize(seqs = n(),
+            patients = length(unique(Subject)))
+
+write_csv(training(splits), build_path("classifier/classifier_data_igblast-train-weights.csv"), append = F)
+write_csv(testing(splits), build_path("classifier/classifier_data_igblast-test-weights.csv"), append = F)
+
+```
+
+
+```{r metadata for fig 1}
+
+trust4 <- 
+  vroom(data_path("sequences/master-trust4-dataset-sequence-unfiltered.csv"))
+
+trust4 %>%
+  group_by(c_call) %>%
+  count()
+
+
+read_metadata() %>%
+  select(Run, BioProject, create_date, Tissue, `Cell Type`, Age, Sex, DonorID, Disease, `Disease Class`, Treatment, `Patient State`, EDSS, `Years disease`) %>%
+  group_by(Age) %>%
+  count()
+
+```
+
+```{r filtering for ballerini}
+
+trust4 <- 
+  vroom(data_path("sequences/master-trust4-dataset-sequence-unfiltered.csv"))
+
+sra_meta_sum <- read_metadata() %>%
+  select(Run, BioProject, create_date, Tissue, Age, Sex, DonorID, Disease)
+
+# Step 1: classify chain type and aggregate per (SRA, chain_type) — no join yet
+trust4_sra <- 
+  trust4 %>%
+  mutate(
+    SRA = str_extract(file_name, "(SRR|ERR)[0-9]+"),
+    chain_type = case_when(
+      str_starts(v_call, "IGHV") ~ coalesce(c_call, "IGH_unknown"),
+      str_starts(v_call, "IGKV") ~ "IGK",
+      str_starts(v_call, "IGLV") ~ "IGL",
+      str_starts(v_call, "TR")   ~ "TCR",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(SRA), !is.na(chain_type)) %>%
+  filter(!str_starts(v_call, "TR")) %>%
+  group_by(SRA) %>% #, chain_type
+  summarise(n_seqs = n(), .groups = "drop")
+
+# Step 2: join the small (SRA × chain_type) table to metadata — fast
+trust4_pre_meta <- trust4_sra %>%
+  left_join(sra_meta_sum, by = c("SRA" = "Run")) %>%
+  filter(!is.na(Disease), !is.na(BioProject)) %>%
+  mutate(tissue_group = case_when(
+    Tissue %in% c('Brain', 'Brain-Lesion', 'Cortex', 'Choroid-Plexus', 'Pia-Mater') ~ 'Brain',
+    Tissue %in% c('Cerebrospinal-Fluid', 'CSF')  ~ 'CSF',
+    Tissue %in% c('Blood', 'PBMC')                ~ 'Blood',
+    TRUE ~ 'Other'
+  ))
+
+trust4_pre_meta %>%
+  group_by(BioProject, Age, Sex, DonorID, Disease) %>%
+  mutate(uid = paste0(sample(letters, 9, replace = T), collapse="")) %>%
+  group_by(BioProject) %>%
+  summarize(total_seqs = sum(n_seqs),
+            median_seqs = median(n_seqs),
+            subjects = length(unique(uid))) %>%
+  filter(median_seqs > 10) %>%
+  arrange(desc(total_seqs)) -> summary
+  
+  
+write_csv(summary, out_path("dataset/quick-summary-stats.csv"))
+```
+
+
+```{r TRUST4 compact isotype summary}
+# Fig. 1E (sequences by chain/isotype and tissue) and Supplemental Table 1 (per-study statistics)
+# are made by analysis/sra_sequence_counts.Rmd.
+```
+
+
+```{r Check possible duplicate study}
+train <- read_csv(build_path("classifier/classifier_data_igblast-train-weights.csv"))
+test <- read_csv(build_path("classifier/classifier_data_igblast-test-weights.csv"))
+
+train %>%
+  filter(Author == 'PRJNA866296')
+
+train %>%
+  filter(Author == 'PRJNA684320') #both problem ds in train, will drop 'PRJNA866296' since it is smaller
+
+train %>%
+  filter(str_count(Author, 'Galson') > 0) %>%
+  group_by(Author) %>%
+  count()
+
+test %>%
+  filter(str_count(Author, 'Galston') > 0) %>%
+  group_by(Author) %>%
+  count() #phew, this was a stupid one opig oas but it is only in the train set, fixed for cv at patient classification time
+
+
+train %>%
+  filter(str_count(Author, 'Zhou') > 0) %>%
+  group_by(Author) %>%
+  count()
+
+test %>%
+  filter(str_count(Author, 'Zhou') > 0) %>%
+  group_by(Author) %>%
+  count() #possible resampling of same patients, will group in patient cv classification
+
+train %>%
+  filter(str_count(Author, 'Zhu') > 0) %>%
+  group_by(Author) %>%
+  count()
+
+test %>%
+  filter(str_count(Author, 'Zhu') > 0) %>%
+  group_by(Author) %>%
+  count() #god bless
+
+train %>%
+  filter(str_count(Author, 'Soto') > 0) %>%
+  group_by(Author) %>%
+  count()
+
+test %>%
+  filter(str_count(Author, 'Soto') > 0) %>%
+  group_by(Author) %>%
+  count() #same fold but from paper these are different patients
+
+
+```
+
+```{r}
+hq <- read_csv(build_path("sequences/all_high_quality_for_igblast.csv"))
+realigned <- read_csv(build_path("sequences/all_hq_igblast_realigned.csv"))
+
+(3447658 - 2785273) / 3447658
+
+```
+
+
+

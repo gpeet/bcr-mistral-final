@@ -1,0 +1,229 @@
+---
+title: "Fig. 3B: full TRUST4 contigs vs V-J clipped sequences"
+---
+
+The published Fig. 3B scores the pre/post treatment sequences as full TRUST4 contigs (leader/5' UTR and
+the start of the constant region included; `dataset/build_treatment_dataset.Rmd`), while the sequence
+classifiers were trained on IgBLAST V-J sequences that passed the classifier-dataset filters
+(`dataset/build_dataset.Rmd`). `dataset/09_treatment_vj.R` makes the consistent variant (`vj`); this
+notebook compares the two: how many sequences pass the filters and how much is trimmed, how the
+per-sequence scores agree, and how the patient scores and paired tests of Fig. 3B change.
+
+Variants in the tests: `contig` (published), `contig_pass` (contig scores of only the sequences that pass
+the IgBLAST filters, which separates the filtering from the clipping) and `vj`.
+
+```{r setup}
+source(here::here("R", "paths.R"))
+suppressPackageStartupMessages({library(tidyverse); library(vroom); library(patchwork)})
+
+FIGURES_DIR <- out_path("figures")
+dir.create(FIGURES_DIR, showWarnings = FALSE, recursive = TRUE)
+BASE <- out_path("sequence-classifier")
+
+# Fig. 3B settings, as in analysis/treatment_analysis.Rmd (default tissue view)
+KNOWN_DRUGS    <- c("Natalizumab", "Fingolimod", "Ocrelizumab", "DMF")
+BENNETT_TISSUE <- c(Fingolimod = "Blood", Natalizumab = "CSF")
+SCORE_PCT      <- 90
+MODELS <- c(exclusion = "LM Exclusion AUGC", baseline = "LM Baseline AUGC")
+
+META <- c("Author", "Subject", "Run", "Treatment", "timepoint", "BSource", "Disease",
+          "Disease Class", "Patient State", "EDSS", "consensus_count")
+```
+
+```{r load}
+read_pred <- function(variant, model, extra = character()) {
+  f <- file.path(BASE, sprintf("treatment_predictions%s_%s.csv", if (variant == "contig") "" else "_vj", model))
+  vroom(f, col_select = any_of(c(META, extra, "ms_score")), show_col_types = FALSE,
+        col_types = cols(.default = col_character(), consensus_count = col_double(), ms_score = col_double())) %>%
+    mutate(across(any_of(c("contig_row", "v_sequence_start", "j_sequence_end")), as.integer))
+}
+
+contig <- read_pred("contig", "exclusion", "sequence") %>%
+  mutate(contig_row = row_number(), len_contig = nchar(sequence), .keep = "unused") %>%
+  rename(contig_exclusion = ms_score) %>%
+  mutate(contig_baseline = read_pred("contig", "baseline")$ms_score)
+
+vj <- read_pred("vj", "exclusion", c("contig_row", "v_sequence_start", "j_sequence_end", "sequence")) %>%
+  mutate(len_vj = nchar(sequence), .keep = "unused") %>%
+  rename(vj_exclusion = ms_score) %>%
+  mutate(vj_baseline = read_pred("vj", "baseline")$ms_score)
+
+seqs <- contig %>%
+  left_join(select(vj, contig_row, v_sequence_start, j_sequence_end, len_vj, vj_exclusion, vj_baseline),
+            by = "contig_row") %>%
+  mutate(pass = !is.na(vj_exclusion), trim_5p = v_sequence_start - 1L, trim_3p = len_contig - j_sequence_end)
+
+# The vj rows must be the contig rows they claim to be
+chk <- vj %>% select(contig_row, Author, Run, Subject) %>% left_join(contig, by = "contig_row", suffix = c("", ".c"))
+stopifnot(nrow(vj) == sum(seqs$pass), identical(chk$Author, chk$Author.c), identical(chk$Run, chk$Run.c),
+          identical(chk$Subject, chk$Subject.c))
+cat(sprintf("%s contig sequences, %s pass the IgBLAST filters (%.1f%%)\n",
+            scales::comma(nrow(seqs)), scales::comma(sum(seqs$pass)), 100 * mean(seqs$pass)))
+```
+
+## Filter pass rate and trimming
+
+```{r pass-rates}
+pass_rates <- seqs %>%
+  group_by(Author, BSource, timepoint) %>%
+  summarize(n_contig = n(), n_vj = sum(pass), pass_pct = 100 * mean(pass),
+            median_len_contig = median(len_contig), median_len_vj = median(len_vj, na.rm = TRUE),
+            median_trim_5p = median(trim_5p, na.rm = TRUE), median_trim_3p = median(trim_3p, na.rm = TRUE),
+            untrimmed_pct = 100 * mean(trim_5p == 0 & trim_3p == 0, na.rm = TRUE), .groups = "drop")
+pass_rates %>% print(n = Inf, width = Inf)
+```
+
+## Per-sequence score agreement (sequences that pass the filters)
+
+```{r per-sequence}
+agreement <- function(x, y) {
+  top_x <- x >= quantile(x, 0.9); top_y <- y >= quantile(y, 0.9)
+  tibble(n = length(x), pearson = cor(x, y), spearman = cor(x, y, method = "spearman"),
+         mean_contig = mean(x), mean_vj = mean(y), mean_shift = mean(y - x),
+         ms_call_contig = mean(x > 0.5), ms_call_vj = mean(y > 0.5),
+         top_decile_overlap = sum(top_x & top_y) / sum(top_x))
+}
+paired_scores <- seqs %>% filter(pass) %>%
+  pivot_longer(c(contig_exclusion, contig_baseline, vj_exclusion, vj_baseline),
+               names_to = c(".value", "model"), names_sep = "_")
+
+seq_summary <- bind_rows(
+  paired_scores %>% group_by(model) %>% group_modify(~ agreement(.x$contig, .x$vj)) %>%
+    mutate(Author = "All studies", BSource = "All", timepoint = "All"),
+  paired_scores %>% group_by(model, Author, BSource, timepoint) %>% group_modify(~ agreement(.x$contig, .x$vj))
+) %>% ungroup() %>%
+  left_join(select(pass_rates, Author, BSource, timepoint, pass_pct, median_trim_5p, median_trim_3p),
+            by = c("Author", "BSource", "timepoint")) %>%
+  relocate(model, Author, BSource, timepoint)
+seq_summary %>% mutate(across(where(is.double), ~ signif(.x, 3))) %>% print(n = Inf, width = Inf)
+write_csv(seq_summary, file.path(FIGURES_DIR, "treatment_contig_vs_vj_sequences.csv"))
+```
+
+## Fig. 3B under each variant
+
+The aggregation and tests are those of `analysis/treatment_analysis.Rmd` (consensus-count-weighted 90th
+percentile per run, baseline/post means per patient, paired Wilcoxon per drug facet and over all studies).
+
+```{r fig3b-functions}
+weighted_percentile <- function(scores, weights, p) {
+  if (length(scores) == 1L) return(scores)
+  idx <- order(scores)
+  cum_w <- cumsum(as.numeric(weights[idx])); cum_w <- cum_w / cum_w[length(cum_w)]
+  approx(cum_w, scores[idx], xout = p / 100, rule = 2)$y
+}
+
+fig3b_paired <- function(raw_preds) {
+  patient_tx <- raw_preds %>%
+    group_by(model, Author, Subject, Run, Treatment, timepoint, BSource, Disease, `Disease Class`, `Patient State`, EDSS) %>%
+    summarize(ms_score_pct = weighted_percentile(ms_score, consensus_count, SCORE_PCT), n_seqs = n(), .groups = "drop")
+  post_rows <- patient_tx %>% filter(timepoint == "post") %>%
+    mutate(drug = str_extract(Treatment, paste(KNOWN_DRUGS, collapse = "|")),
+           tx_months = as.numeric(str_extract(Treatment, "\\d+(?=\\s*months?)"))) %>%
+    filter(!is.na(drug))
+  baseline_rows <- patient_tx %>% filter(timepoint == "baseline") %>%
+    inner_join(post_rows %>% distinct(model, Author, Subject, BSource, drug),
+               by = c("model", "Author", "Subject", "BSource"), relationship = "many-to-many")
+  parsed <- bind_rows(post_rows, baseline_rows) %>%
+    mutate(drug_label = if_else(!is.na(tx_months), paste0(drug, " ", tx_months, "mo (", Author, ")"),
+                                paste0(drug, " (", Author, ")"))) %>%
+    filter(!(Author == "BennettMS" & drug %in% names(BENNETT_TISSUE) & BSource != BENNETT_TISSUE[drug]))
+  baseline_agg <- parsed %>% filter(timepoint == "baseline") %>%
+    group_by(model, Author, Subject, BSource, Disease, `Disease Class`, drug) %>%
+    summarize(baseline_pct = mean(ms_score_pct), .groups = "drop")
+  post_agg <- parsed %>% filter(timepoint == "post") %>%
+    group_by(model, Author, Subject, BSource, Disease, `Disease Class`, drug, drug_label, tx_months) %>%
+    summarize(post_pct = mean(ms_score_pct), .groups = "drop")
+  inner_join(baseline_agg, post_agg, by = c("model", "Author", "Subject", "BSource", "Disease", "Disease Class", "drug")) %>%
+    mutate(delta_pct = post_pct - baseline_pct)
+}
+
+paired_tests <- function(paired) {
+  wt <- function(.x) {
+    w <- wilcox.test(.x$post_pct, .x$baseline_pct, paired = TRUE, exact = FALSE)
+    tibble(statistic = w$statistic, p.value = w$p.value, n_pairs = nrow(.x),
+           mean_delta = mean(.x$delta_pct), n_down = sum(.x$delta_pct < 0))
+  }
+  per_study <- paired %>% group_by(model, drug_label, BSource) %>% filter(n() >= 2) %>%
+    group_modify(~ wt(.x)) %>% group_by(model) %>% mutate(p_adj = p.adjust(p.value, method = "BH")) %>% ungroup()
+  all_studies <- paired %>% group_by(model, BSource) %>% filter(n() >= 2) %>%
+    group_modify(~ wt(.x)) %>% ungroup() %>% mutate(drug_label = "All studies")
+  bind_rows(per_study, all_studies)
+}
+```
+
+```{r fig3b-variants}
+as_raw <- function(df, prefix) {
+  map_dfr(names(MODELS), ~ df %>% mutate(model = MODELS[[.x]], ms_score = .data[[paste0(prefix, "_", .x)]]))
+}
+variants <- list(contig      = as_raw(seqs, "contig"),
+                 contig_pass = as_raw(filter(seqs, pass), "contig"),
+                 vj          = as_raw(filter(seqs, pass), "vj"))
+paired <- imap_dfr(variants, ~ fig3b_paired(.x) %>% mutate(variant = .y))
+tests  <- paired %>% group_by(variant) %>% group_modify(~ paired_tests(.x)) %>% ungroup() %>%
+  mutate(variant = factor(variant, names(variants))) %>%
+  arrange(model, drug_label, BSource, variant) %>%
+  relocate(model, drug_label, BSource, variant, n_pairs)
+write_csv(tests, file.path(FIGURES_DIR, "treatment_contig_vs_vj_tests.csv"))
+
+tests %>% filter(model == MODELS[["exclusion"]]) %>%
+  mutate(across(where(is.double), ~ signif(.x, 3))) %>% print(n = Inf, width = Inf)
+```
+
+The two tests quoted in the text (exclusion model): Fingolimod blood, n = 10 (PRJNA1054089, 12 months)
+and natalizumab CSF, n = 4 (BennettMS). The `contig` rows reproduce the published values.
+
+```{r quoted-tests}
+tests %>%
+  filter(model == MODELS[["exclusion"]],
+         drug_label %in% c("Fingolimod 12mo (PRJNA1054089)", "Natalizumab 6mo (BennettMS)")) %>%
+  select(drug_label, BSource, variant, n_pairs, statistic, p.value, mean_delta, n_down)
+```
+
+```{r patient-agreement}
+patient_cmp <- paired %>%
+  select(variant, model, Author, Subject, BSource, drug_label, baseline_pct, post_pct, delta_pct) %>%
+  pivot_wider(names_from = variant, values_from = c(baseline_pct, post_pct, delta_pct))
+patient_cmp %>% group_by(model) %>%
+  summarize(n_pairs = n(), n_missing_vj = sum(is.na(delta_pct_vj)),
+            cor_score = cor(c(baseline_pct_contig, post_pct_contig), c(baseline_pct_vj, post_pct_vj), use = "complete.obs"),
+            mean_score_shift = mean(c(baseline_pct_vj - baseline_pct_contig, post_pct_vj - post_pct_contig), na.rm = TRUE),
+            cor_delta = cor(delta_pct_contig, delta_pct_vj, use = "complete.obs"),
+            delta_sign_agreement = mean(sign(delta_pct_contig) == sign(delta_pct_vj), na.rm = TRUE))
+```
+
+## Figure
+
+```{r figure, fig.width = 11, fig.height = 8}
+ex <- MODELS[["exclusion"]]
+pa <- seqs %>% filter(pass) %>%
+  ggplot(aes(contig_exclusion, vj_exclusion)) +
+  geom_bin2d(bins = 50) + scale_fill_viridis_c(trans = "log10", name = "Sequences") +
+  geom_abline(linetype = 2, colour = "grey40") + facet_wrap(~BSource) + coord_equal() +
+  labs(x = "MS score, contig", y = "MS score, V-J", title = "A  Per-sequence scores (exclusion model)")
+
+pts <- patient_cmp %>% filter(model == ex) %>%
+  pivot_longer(c(baseline_pct_contig, post_pct_contig, baseline_pct_vj, post_pct_vj),
+               names_to = c("timepoint", ".value"), names_pattern = "(baseline|post)_pct_(.*)")
+pb <- ggplot(pts, aes(contig, vj, colour = drug_label, shape = timepoint)) +
+  geom_abline(linetype = 2, colour = "grey40") + geom_point(size = 2, alpha = 0.8) +
+  labs(x = sprintf("Patient MS score (%dth pct), contig", SCORE_PCT), y = "Patient MS score, V-J",
+       colour = NULL, shape = NULL, title = "B  Patient scores")
+
+pc <- patient_cmp %>% filter(model == ex) %>%
+  ggplot(aes(delta_pct_contig, delta_pct_vj, colour = drug_label)) +
+  geom_hline(yintercept = 0, colour = "grey70") + geom_vline(xintercept = 0, colour = "grey70") +
+  geom_abline(linetype = 2, colour = "grey40") + geom_point(size = 2, alpha = 0.8) +
+  labs(x = "Post - pre, contig", y = "Post - pre, V-J", colour = NULL, title = "C  Treatment change per patient")
+
+pd <- tests %>% filter(model == ex) %>%
+  mutate(facet = paste0(drug_label, ", ", BSource, " (n = ", n_pairs, ")")) %>%
+  ggplot(aes(p.value, fct_rev(facet), colour = variant)) +
+  geom_vline(xintercept = 0.05, linetype = 2, colour = "grey60") +
+  geom_point(size = 2.5, position = position_dodge(width = 0.5)) +
+  scale_x_continuous(limits = c(0, 1)) + scale_colour_manual(values = c(contig = "black", contig_pass = "grey60", vj = "#D55E00")) +
+  labs(x = "Paired Wilcoxon p", y = NULL, colour = NULL, title = "D  Fig. 3B tests")
+
+p <- (pa | pb) / (pc | pd) & theme_linedraw(base_size = 9) & theme(panel.grid = element_blank())
+p
+ggsave(file.path(FIGURES_DIR, "figS_treatment_contig_vs_vj.svg"), p, width = 11, height = 8)
+```

@@ -1,0 +1,29 @@
+# R 4.4.1 plus the system libraries the R packages compile against.
+# The R packages themselves are pinned in renv.lock (see envs/setup_r_env.sh).
+name: bcrm-r
+channels:
+  - conda-forge
+dependencies:
+  - r-base=4.4.1
+  - r-recommended      # MASS, Matrix, survival, ... (built into most R installs)
+  - r-renv
+  - gcc_linux-64=13      # gcc 15 cannot build some pinned packages (readxl)
+  - gxx_linux-64=13
+  - gfortran_linux-64=13
+  - make
+  - cmake<4             # nloptr's bundled NLopt needs CMake 3
+  - pkg-config
+  - libcurl
+  - openssl
+  - libxml2
+  - libgit2
+  - harfbuzz
+  - fribidi
+  - freetype
+  - libpng
+  - libtiff
+  - libjpeg-turbo
+  - fontconfig
+  - expat               # fontconfig.pc requires expat.pc; without it systemfonts finds no FreeType flags
+  - zlib
+  - pandoc

@@ -1,0 +1,258 @@
+---
+title: "Pre/post treatment analysis"
+params:
+  bennett_fingolimod: Blood    # BennettMS tissue kept for each drug (legend: Fingolimod blood,
+  bennett_natalizumab: CSF     # Natalizumab CSF). Render the other view with e.g.
+                               # rmarkdown::render(..., params = list(bennett_fingolimod = "CSF", bennett_natalizumab = "Blood"))
+  sequences: contig            # contig: full TRUST4 contigs (published Fig. 3B); vj: V-J clipped like the
+                               # classifier training data (dataset/09_treatment_vj.R); figures get a _vj suffix
+---
+
+```{r setup}
+source(here::here("R", "paths.R"))
+library(tidyverse)
+library(patchwork)
+library(ggbeeswarm)
+library(rstatix)
+
+FIGURES_DIR <- out_path("figures")
+dir.create(FIGURES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+BASELINE_TX <- c("Pretreatment", "Treatment naive", "No treatment",
+                 "No recent treatment")
+
+BASE <- out_path("sequence-classifier")
+
+stopifnot(params$sequences %in% c("contig", "vj"))
+SEQ_SUFFIX <- if (params$sequences == "contig") "" else paste0("_", params$sequences)
+
+PRED_FILES <- list(
+  "LM Exclusion AUGC" = file.path(BASE, paste0("treatment_predictions", SEQ_SUFFIX, "_exclusion.csv")),
+  "LM Baseline AUGC"  = file.path(BASE, paste0("treatment_predictions", SEQ_SUFFIX, "_baseline.csv"))
+)
+
+# Known drug names to extract from the Treatment column via regex
+KNOWN_DRUGS <- c("Natalizumab", "Fingolimod", "Ocrelizumab", "DMF") #skipping cladribine since very few sequences
+
+# BennettMS tissue filtering (set in the params header; defaults follow the legend)
+BENNETT_TISSUE <- c(Fingolimod = params$bennett_fingolimod, Natalizumab = params$bennett_natalizumab)
+# Suffix for figure files, so each tissue view is saved under its own name
+BENNETT_SUFFIX <- paste0("bennett_", paste0(names(BENNETT_TISSUE), BENNETT_TISSUE, collapse = "_"), SEQ_SUFFIX)
+
+# Percentile used for per-patient score aggregation (change to e.g. 95 to use 95th pct)
+SCORE_PCT <- 90
+```
+
+```{r load-treatment-predictions}
+raw_preds <-
+  imap(PRED_FILES, ~ read_csv(.x, show_col_types = FALSE) %>% mutate(model = .y)) %>%
+  reduce(bind_rows)
+
+cat(sprintf(
+  "Loaded %s sequences across %d models\n",
+  scales::comma(nrow(raw_preds)),
+  n_distinct(raw_preds$model)
+))
+
+raw_preds %>%
+  count(model, timepoint, sort = TRUE)
+```
+
+```{r patient-aggregation}
+# Weighted percentile via sorted cumulative weights (mirrors Python summarize_patients.py)
+weighted_percentile <- function(scores, weights, p) {
+  if (length(scores) == 1L) return(scores)
+  idx           <- order(scores)
+  sorted_scores <- scores[idx]
+  cum_w         <- cumsum(as.numeric(weights[idx]))
+  cum_w         <- cum_w / cum_w[length(cum_w)]
+  approx(cum_w, sorted_scores, xout = p / 100, rule = 2)$y
+}
+
+# Aggregate to patient × run × tissue × model.
+# ms_score_pct = consensus-count-weighted Nth percentile of per-sequence MS scores.
+patient_tx <- raw_preds %>%
+  group_by(model, Author, Subject, Run, Treatment, timepoint,
+           BSource, Disease, `Disease Class`, `Patient State`, EDSS) %>%
+  summarize(
+    ms_score_pct = weighted_percentile(ms_score, consensus_count, SCORE_PCT),
+    n_seqs       = n(),
+    .groups      = "drop"
+  )
+
+patient_tx %>%
+  count(model, timepoint, Disease, BSource)
+```
+
+```{r parse-treatments}
+# Extract drug name and timepoint from the Treatment column
+drug_regex <- paste(KNOWN_DRUGS, collapse = "|")
+
+# Post-treatment rows: extract drug and month-timepoint
+post_rows <- patient_tx %>%
+  filter(timepoint == "post") %>%
+  mutate(
+    drug      = str_extract(Treatment, drug_regex),
+    tx_months = as.numeric(str_extract(Treatment, "\\d+(?=\\s*months?)"))
+  ) %>%
+  filter(!is.na(drug))   # drugs outside KNOWN_DRUGS (Cladribine) would otherwise form an "NA" facet
+
+# Baseline rows: one copy per drug that the patient's post rows use
+# (handles BennettMS where the same baseline pairs with two different drugs)
+baseline_rows <- patient_tx %>%
+  filter(timepoint == "baseline") %>%
+  inner_join(
+    post_rows %>% distinct(model, Author, Subject, BSource, drug),
+    by = c("model", "Author", "Subject", "BSource"),
+    relationship = "many-to-many"
+  )
+
+# Combine and build drug_label
+patient_tx_parsed <- bind_rows(post_rows, baseline_rows) %>%
+  mutate(drug_label = case_when(
+    !is.na(tx_months) ~ paste0(drug, " ", tx_months, "mo (", Author, ")"),
+    TRUE              ~ paste0(drug, " (", Author, ")")
+  ))
+
+# BennettMS tissue filter: keep one tissue per drug (BENNETT_TISSUE)
+patient_tx_parsed <- patient_tx_parsed %>%
+  filter(
+    !(Author == "BennettMS" & drug %in% names(BENNETT_TISSUE) &
+      BSource != BENNETT_TISSUE[drug])
+  )
+
+cat(sprintf("After parsing: %d rows, %d drug_labels\n",
+            nrow(patient_tx_parsed), n_distinct(patient_tx_parsed$drug_label)))
+patient_tx_parsed %>%
+  count(model, Author, drug_label, BSource, timepoint) %>%
+  print(n = 50)
+```
+
+```{r paired-data-construction}
+# Explicit baseline/post join keyed on drug — preserves multi-timepoint
+# resolution (e.g. a drug sampled at 6 and 12 months, each compared to baseline).
+baseline_agg <- patient_tx_parsed %>%
+  filter(timepoint == "baseline") %>%
+  group_by(model, Author, Subject, BSource, Disease, `Disease Class`, drug) %>%
+  summarize(baseline_pct = mean(ms_score_pct), .groups = "drop", count = sum(n_seqs))
+
+post_agg <- patient_tx_parsed %>%
+  filter(timepoint == "post") %>%
+  group_by(model, Author, Subject, BSource, Disease, `Disease Class`,
+           drug, drug_label, tx_months) %>%
+  summarize(post_pct = mean(ms_score_pct), .groups = "drop", count = sum(n_seqs))
+
+paired <- inner_join(baseline_agg, post_agg,
+  by = c("model", "Author", "Subject", "BSource", "Disease", "Disease Class", "drug")
+) %>%
+  mutate(
+    delta_pct = post_pct - baseline_pct,
+    fc_pct    = post_pct / (baseline_pct + 1e-6)
+  )
+
+cat(sprintf(
+  "Paired subjects: %d across %d studies (%d drug-timepoints)\n",
+  n_distinct(paste(paired$Author, paired$Subject)),
+  n_distinct(paired$Author),
+  n_distinct(paired$drug_label)
+))
+
+paired %>%
+  count(model, drug_label, BSource, sort = TRUE)
+```
+
+```{r paired-tests}
+run_paired_tests <- function(df, metric_pre, metric_post, label) {
+  # Per-drug-label tests (min 5 pairs)
+  per_study <- df %>%
+    group_by(model, drug_label, BSource) %>%
+    filter(n() >= 2) %>%
+    group_modify(~ {
+      wt <- wilcox.test(
+        .x[[metric_post]], .x[[metric_pre]],
+        paired = TRUE, exact = FALSE
+      )
+      tibble(
+        statistic = wt$statistic,
+        p.value   = wt$p.value,
+        n_pairs   = nrow(.x),
+        metric    = label
+      )
+    }) %>%
+    ungroup()
+
+  # Aggregated across all studies
+  agg <- df %>%
+    group_by(model, BSource) %>%
+    filter(n() >= 2) %>%
+    group_modify(~ {
+      wt <- wilcox.test(
+        .x[[metric_post]], .x[[metric_pre]],
+        paired = TRUE, exact = FALSE
+      )
+      tibble(
+        drug_label = "All studies",
+        statistic  = wt$statistic,
+        p.value    = wt$p.value,
+        n_pairs    = nrow(.x),
+        metric     = label
+      )
+    }) %>%
+    ungroup()
+
+  per_study <- per_study %>%
+    mutate(p_adj = p.adjust(p.value, method = "BH"))
+  bind_rows(per_study, agg)
+}
+
+test_results <- run_paired_tests(
+  paired %>% filter(model == "LM Exclusion AUGC"),
+  "baseline_pct", "post_pct", sprintf("ms_score_%dpct", SCORE_PCT)
+)
+
+test_results %>%
+  arrange(p_adj) %>%
+  print(n = 50)
+```
+
+```{r trajectory-plot}
+# Spaghetti plot: one line per patient connecting all available timepoints.
+# Aggregates across runs to patient level, uses month-based x-axis so that
+# multi-timepoint drugs (e.g. 6 and 12 months) appear in a single facet
+# with Pre → 6mo → 12mo trajectory lines.
+traj_data <- patient_tx_parsed %>%
+  filter(model == "LM Exclusion AUGC") %>%
+  mutate(
+    study_drug = paste0(drug, " (", Author, ")"),
+    tx_label = case_when(
+      timepoint == "baseline" ~ "Pre",
+      !is.na(tx_months)       ~ paste0(tx_months, "mo"),
+      TRUE                    ~ "Post"
+    ),
+    month_num = case_when(
+      timepoint == "baseline" ~ 0,
+      !is.na(tx_months)       ~ tx_months,
+      TRUE                    ~ 99
+    )
+  ) %>%
+  group_by(Author, Subject, BSource, Disease, study_drug, tx_label, month_num) %>%
+  summarize(ms_score_pct = mean(ms_score_pct), .groups = "drop") %>%
+  mutate(tx_label = fct_reorder(tx_label, month_num))
+
+traj_data %>%
+  ggplot(aes(x = tx_label, y = ms_score_pct,
+             group = paste(Author, Subject), colour = Disease)) +
+  geom_line(alpha = 0.45) +
+  geom_point(alpha = 0.65, size = 1.2) +
+  facet_wrap(~study_drug, scales = "free") +
+  scale_colour_viridis_d() +
+  theme_linedraw(base_size = 10) +
+  theme(panel.grid = element_blank()) +
+  labs(
+    x     = NULL,
+    y     = sprintf("MS score (%dth pct, weighted)", SCORE_PCT),
+    title = "Pre/post treatment trajectories"
+  ) -> p_trajectory
+p_trajectory
+ggsave(file.path(FIGURES_DIR, paste0("fig3B_treatment_trajectories_", BENNETT_SUFFIX, ".svg")), p_trajectory, width = 6, height = 4)
+```

@@ -1,0 +1,12 @@
+[project]
+name = "bcrm"
+version = "1.0.0"
+description = "Path helpers for the bcr-mistral reproduction code"
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["bcrm"]

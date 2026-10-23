@@ -1,0 +1,186 @@
+---
+title: "Public clones"
+---
+
+```{r}
+source(here::here("R", "paths.R"))
+source(here::here("R", "exclusions.R"))
+library(tidyverse)
+library(readxl)
+library(vroom)
+```
+
+```{r Get CDR3 AA Data}
+# Quality-filtered TRUST4 IGH sequences (built by dataset/08_preliminary_trust4.R)
+filtering <- 
+  read_csv(data_path("sequences/preliminary-trust4-quality-sequences.csv")) %>%
+  filter(!is.na(BioProject) & (!is.na(DonorID) | !is.na(Age) | !is.na(Sex))) %>%
+  drop_duplicate_repertoires("BioProject", "DonorID")   # duplicated repertoires (R/exclusions.R)
+```
+
+```{r Deduplicated datasets}
+# Individual-deduplicated (for within-project analysis)
+# Restrict to donors with a known DonorID so unidentified patients don't inflate counts
+indiv_dedup <- filtering %>%
+  filter(!is.na(BioProject), !is.na(DonorID), str_length(junction_aa) > 1) %>%
+  mutate(Disease = fct_lump(Disease, n = 1)) %>%
+  group_by(BioProject, DonorID, Age, Sex, Disease) %>%
+  distinct(junction_aa) %>%
+  ungroup() %>%
+  mutate(junction_len = nchar(junction_aa))
+
+# Project-deduplicated (for across-project analysis)
+# Same DonorID requirement — unidentified donors could represent multiple individuals
+project_dedup <- filtering %>%
+  filter(!is.na(BioProject), !is.na(DonorID), str_length(junction_aa) > 1) %>%
+  mutate(Disease = fct_lump(Disease, n = 1)) %>%
+  group_by(BioProject, Disease) %>%
+  distinct(junction_aa) %>%
+  ungroup() %>%
+  mutate(junction_len = nchar(junction_aa))
+```
+
+```{r Empirical collision rate across scales}
+# Measure the actual collision rate (distinct junction_aa appearing ≥2 times)
+# at many sample sizes by repeated subsampling. The junction_aa frequency
+# distribution is too skewed for any analytic formula (birthday-problem,
+# Poisson occupancy, etc.) so we estimate empirically instead.
+
+set.seed(42)
+sample_sizes <- c(1e2, 2e2, 5e2, 1e3, 2e3, 5e3, 1e4, 2e4, 5e4, 1e5, 2e5, 3e5, 4e5)
+n_reps <- 20
+
+count_collisions <- function(data, size) {
+  sampled <- data %>% slice_sample(n = min(size, nrow(data)))
+  sampled %>%
+    group_by(junction_aa) %>%
+    filter(n() > 1) %>%
+    ungroup() %>%
+    summarize(n = n_distinct(junction_aa)) %>%
+    pull(n)
+}
+
+# Within-project pool (indiv_dedup)
+within_rates <- expand_grid(sample_size = sample_sizes, rep = 1:n_reps) %>%
+  filter(sample_size <= nrow(indiv_dedup)) %>%
+  mutate(n_collisions = map_dbl(sample_size, ~count_collisions(indiv_dedup, .x)))
+
+# Across-project pool (project_dedup)
+across_rates <- expand_grid(sample_size = sample_sizes, rep = 1:n_reps) %>%
+  filter(sample_size <= nrow(project_dedup)) %>%
+  mutate(n_collisions = map_dbl(sample_size, ~count_collisions(project_dedup, .x)))
+
+# Fit log-log linear models (collisions scale as power law with sample size)
+fit_within <- lm(log(n_collisions) ~ log(sample_size),
+                 data = within_rates %>% filter(n_collisions > 0))
+fit_across <- lm(log(n_collisions) ~ log(sample_size),
+                 data = across_rates %>% filter(n_collisions > 0))
+
+expected_collisions_within <- function(N) {
+  exp(predict(fit_within, newdata = tibble(sample_size = N))) %>% unname()
+}
+expected_collisions_across <- function(N) {
+  exp(predict(fit_across, newdata = tibble(sample_size = N))) %>% unname()
+}
+
+# Validate: observed vs predicted fold should be ~1 across scales
+within_rates %>%
+  filter(n_collisions > 0) %>%
+  group_by(sample_size) %>%
+  summarize(observed = mean(n_collisions)) %>%
+  mutate(expected = expected_collisions_within(sample_size),
+         fold = observed / expected)
+
+summary(fit_within)
+summary(fit_across)
+```
+
+```{r Clone rate enrichment by study}
+# The study is the unit of replication: sequences within a study are clonally related and share
+# patients, so tests over sequence counts would treat them as independent. Estimates use all data;
+# their uncertainty comes from a leave-one-study-out jackknife (a bootstrap cannot be used for the
+# across-study arm, where a study drawn twice would share every clone with itself). The expected
+# collision curves fitted above are held fixed.
+
+# Within study: CDR3s shared between patients of the same study, per study and disease group
+within_by_study <- indiv_dedup %>%
+  count(BioProject, Disease, junction_aa, name = "n_patients") %>%
+  group_by(BioProject, Disease) %>%
+  summarize(clones = sum(n_patients > 1), total = sum(n_patients), .groups = "drop") %>%
+  mutate(expected = expected_collisions_within(total))
+
+within_enrichment <- function(drop = NULL) {
+  within_by_study %>%
+    filter(!BioProject %in% drop) %>%
+    group_by(Disease) %>%
+    summarize(enrichment = mean(clones / total) / mean(expected / total), .groups = "drop")
+}
+
+# Across studies: CDR3s shared between studies, each study deduplicated, per disease group
+across_enrichment <- function(drop = NULL) {
+  project_dedup %>%
+    filter(!BioProject %in% drop) %>%
+    count(Disease, junction_aa, name = "n_studies") %>%
+    group_by(Disease) %>%
+    summarize(clones = sum(n_studies > 1), total = sum(n_studies), .groups = "drop") %>%
+    mutate(enrichment = (clones / total) / (expected_collisions_across(total) / total)) %>%
+    select(Disease, enrichment)
+}
+
+estimate_log10 <- function(drop = NULL) {
+  bind_rows(`Within study` = within_enrichment(drop), `Across studies` = across_enrichment(drop),
+            .id = "group") %>%
+    mutate(log_enrichment = log10(enrichment)) %>%
+    select(group, Disease, log_enrichment)
+}
+
+full <- estimate_log10()
+studies_by_disease <- distinct(project_dedup, Disease, BioProject)
+jackknife <- map_dfr(unique(studies_by_disease$BioProject),
+                     ~ estimate_log10(drop = .x) %>% mutate(left_out = .x))
+
+# Jackknife over the studies that contain each disease group (leaving out any other study changes nothing)
+jk <- jackknife %>%
+  semi_join(studies_by_disease, by = c("Disease", "left_out" = "BioProject"))
+jk_se <- function(x) { n <- length(x); sqrt((n - 1) / n * sum((x - mean(x))^2)) }
+
+clone_enrichment <- jk %>%
+  group_by(group, Disease) %>%
+  summarize(n_studies = n(), se = jk_se(log_enrichment), .groups = "drop") %>%
+  left_join(full, by = c("group", "Disease")) %>%
+  mutate(ci_low  = log_enrichment - qt(0.975, n_studies - 1) * se,
+         ci_high = log_enrichment + qt(0.975, n_studies - 1) * se,
+         p_vs_expected = 2 * pt(-abs(log_enrichment / se), n_studies - 1))
+
+# Within vs across, paired over the same left-out study
+within_vs_across <- jk %>%
+  pivot_wider(names_from = group, values_from = log_enrichment) %>%
+  mutate(diff = `Within study` - `Across studies`) %>%
+  group_by(Disease) %>%
+  summarize(n_studies = n(), se_diff = jk_se(diff), .groups = "drop") %>%
+  left_join(full %>% pivot_wider(names_from = group, values_from = log_enrichment) %>%
+              transmute(Disease, diff = `Within study` - `Across studies`), by = "Disease") %>%
+  mutate(p_within_vs_across = 2 * pt(-abs(diff / se_diff), n_studies - 1))
+
+clone_enrichment
+within_vs_across
+write_csv(left_join(clone_enrichment, select(within_vs_across, Disease, p_within_vs_across), by = "Disease"),
+          out_path('figures/fig1H_clone_rate_enrichment.csv'))
+```
+
+```{r Plot clone rate enrichment}
+clone_enrichment %>%
+  mutate(group = fct_relevel(group, "Within study")) %>%
+  ggplot(aes(x = group, y = log_enrichment, fill = Disease)) +
+  geom_col(position = 'dodge') +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high),
+                position = position_dodge(width = 0.9), width = 0.5) +
+  geom_hline(yintercept = 0) +
+  theme_linedraw(base_size = 10) +
+  scale_fill_viridis_d() +
+  theme(panel.grid = element_blank()) +
+  labs(x = NULL, y = "log10(clone rate enrichment)",
+       caption = "Bars: all studies; error bars: 95% CI, leave-one-study-out jackknife")
+
+ggsave(out_path('figures/fig1H_clone_rate_enrichment.svg'))
+```

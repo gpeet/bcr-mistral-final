@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data (large files live under BCRM_DATA, not in the repo)
+*.fastq
+*.fastq.gz
+*.bam
+*.sra
+*.csv.gz
+
+# SLURM logs
+*.out
+
+# macOS
+.DS_Store
+._*
+
+# Old private development history (kept locally, never pushed)
+.git-dev-history/
+
+# Model weights and large data (BCRM_MODELS / BCRM_DATA, not in git)
+*.pth
+*.pt
+*.safetensors
+*.ckpt
+dataset/*.csv
+dataset/*.xlsx
+foundation-models/data/
+foundation-models/models/
+embeddings/*.csv
+
+# Data, weights and outputs live under BCRM_DATA / BCRM_MODELS / BCRM_OUT (see docs/DATA_LAYOUT.md)
+/data/
+/models/
+/results/
+*.xlsx
+
+# Rendered notebooks (HTML) embed local paths and are not tracked; render them yourself
+*.html
+
+# Local workflow settings
+workflow/config.sh
+
+# R session and renv project files
+.Rhistory
+.RData
+.Rproj.user/
+renv/library/
+renv/staging/
+!dataset/trust4_run_modes.csv
+
+# knitr caches and figure folders from rendering
+*_cache/
+*_files/

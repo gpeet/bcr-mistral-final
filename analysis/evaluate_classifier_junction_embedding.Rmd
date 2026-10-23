@@ -1,0 +1,156 @@
+---
+title: "Junction Classifier Evaluation"
+---
+
+```{r setup}
+source(here::here("R", "paths.R"))
+library(tidyverse)
+
+FIGURES_DIR <- out_path("figures")
+dir.create(FIGURES_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r load-predictions}
+# ── Paths ──────────────────────────────────────────────────────────────────────
+BASE <- out_path("sequence-classifier")
+
+ENSEMBLE_DIRS <- list(
+  "Junction LM Exclusion" = file.path(BASE, "ensemble-output-junction-exclusion"),
+  "Junction LM Baseline"  = file.path(BASE, "ensemble-output-junction-baseline")
+)
+
+COMPARATOR_MODELS <- c(
+  "junction_kmer_glm",
+  "junction_kmer_rf",
+  "junction_protein_glm",
+  "junction_protein_rf"
+)
+
+COMPARATOR_LABELS <- c(
+  junction_kmer_glm     = "Junction k-mer GLM",
+  junction_kmer_rf      = "Junction k-mer RF",
+  junction_protein_glm  = "Junction protein GLM",
+  junction_protein_rf   = "Junction protein RF"
+)
+
+COMPARATOR_BASE <- file.path(BASE, "comparator-output")
+
+# ── Helper ─────────────────────────────────────────────────────────────────────
+load_ensemble <- function(dir, model_label) {
+  bind_rows(
+    read_csv(file.path(dir, "unflipped/predictions/ensemble_predictions.csv"),
+             show_col_types = FALSE),
+    read_csv(file.path(dir, "flipped/predictions/ensemble_predictions.csv"),
+             show_col_types = FALSE)
+  ) %>%
+    dplyr::rename(
+      `prob_Multiple sclerosis` = ms_score,
+      Predicted                 = predicted_class,
+      Disease                   = true_label
+    ) %>%
+    mutate(Disease_orig = Disease, model = model_label)
+}
+
+# ── LM models ─────────────────────────────────────────────────────────────────
+lm_preds <- imap(ENSEMBLE_DIRS, load_ensemble)
+
+# ── Comparator models ──────────────────────────────────────────────────────────
+comp_preds <- map(COMPARATOR_MODELS, function(m) {
+  load_ensemble(file.path(COMPARATOR_BASE, m), COMPARATOR_LABELS[[m]])
+})
+
+# ── Combine and filter ─────────────────────────────────────────────────────────
+all_preds <-
+  c(lm_preds, comp_preds) %>%
+  map(select, `prob_Multiple sclerosis`, Disease, Disease_orig, Predicted, Author, Subject, model) %>%
+  reduce(bind_rows) %>%
+  mutate(
+    Predicted = if_else(Predicted == "Multiple sclerosis", "Multiple sclerosis", "Other"),
+    Disease   = if_else(Disease   == "Multiple sclerosis", "Multiple sclerosis", "Other")
+  ) %>%
+  # Remove known duplicate / confounded BioProjects
+  filter(Author != "PRJNA248475", Author != "PRJNA248411",
+         Author != "PRJNA866296") %>%
+  # Remove MS twins
+  mutate(Disease = if_else(str_detect(Subject, "Twin(?:1|2|3|4)\\.2"), "MS Twin", Disease)) %>%
+  mutate(Disease = if_else(str_detect(Subject, "SCNI"),                "MS Twin", Disease)) %>%
+  filter(Disease != "MS Twin") %>%
+  mutate(
+    Disease   = factor(Disease),
+    Predicted = factor(Predicted, levels = levels(Disease))
+  )
+```
+
+```{r model-order}
+LM_ORDER <- c(
+  "Junction LM Exclusion",
+  "Junction LM Baseline"
+)
+
+COMP_ORDER <- c(
+  "Junction k-mer GLM",
+  "Junction k-mer RF",
+  "Junction protein GLM",
+  "Junction protein RF"
+)
+
+MODEL_ORDER <- c(LM_ORDER, COMP_ORDER, "Random (permuted)")
+
+MODEL_COLOURS <- c(
+  setNames(
+    viridis::viridis(length(MODEL_ORDER) - 1L, option = "D", begin = 0.05, end = 0.9),
+    MODEL_ORDER[MODEL_ORDER != "Random (permuted)"]
+  ),
+  "Random (permuted)" = "grey70"
+)
+```
+
+```{r prior}
+# Prior = MS prevalence in the evaluation set (random baseline achieves this)
+prior_main <- all_preds %>%
+  filter(model == "Junction LM Exclusion") %>%
+  summarize(p = mean(Disease == "Multiple sclerosis")) %>%
+  pull(p)
+```
+
+```{r topk-fold-curves}
+# Continuous precision & recall fold-enrichment curves across top-k thresholds.
+CURVE_MODELS  <- MODEL_ORDER[MODEL_ORDER != "Random (permuted)"]
+CURVE_X_START <- 0.5   # rightmost top-k fraction (top 50%)
+
+curve_fracs <- seq(CURVE_X_START, 0.00001, length.out = 200)
+
+curve_data <- map_dfr(CURVE_MODELS, function(mod) {
+  dat   <- all_preds %>% filter(model == mod)
+  n     <- nrow(dat)
+  n_pos <- sum(dat$Disease == "Multiple sclerosis")
+  map_dfr(curve_fracs, function(f) {
+    k    <- max(1L, round(n * f))
+    top  <- slice_max(dat, `prob_Multiple sclerosis`, n = k, with_ties = FALSE)
+    prec <- mean(top$Disease == "Multiple sclerosis")
+    rec  <- if (n_pos > 0) sum(top$Disease == "Multiple sclerosis") / n_pos else NA_real_
+    tibble(model = mod, frac = f,
+           precision = prec, recall = rec,
+           prec_fold = prec / prior_main,
+           rec_fold  = rec / frac)
+  })
+})
+
+CURVE_COLOURS <- MODEL_COLOURS[CURVE_MODELS]
+
+p_prec_curve <- ggplot(curve_data, aes(x = frac, y = prec_fold, colour = model)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  scale_x_reverse(labels = scales::percent_format()) +
+  scale_colour_manual(values = CURVE_COLOURS) +
+  theme_linedraw(base_size = 8) +
+  theme(panel.grid = element_blank(), legend.position = "none", aspect.ratio = 2) +
+  labs(x = "Top-k threshold", y = "Fold enrichment (precision / prior)",
+       title = "Precision fold enrichment across top-k", colour = NULL) +
+  scale_y_continuous(transform = 'log2', limits = c(0.5,2))
+p_prec_curve
+ggsave(file.path(FIGURES_DIR, "fig2F_precision_fold_curve_junction.svg"),
+       p_prec_curve, width = 1.5, height = 3)
+
+
+```

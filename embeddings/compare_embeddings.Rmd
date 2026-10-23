@@ -1,0 +1,576 @@
+---
+title: "Embedding comparison across language models (Fig. 2C, S1A)"
+---
+
+```{r}
+source(here::here("R", "paths.R"))
+source(here::here("R", "metadata.R"))
+library(tidyverse)
+library(readxl)
+library(vroom)
+```
+
+```{r Test dataset for embedding triplet losses, eval = FALSE}
+# Rebuilds the triplet test set from the master tables (unseeded). Not run by default:
+# the chunks below read the shipped set, embedding-comparison/triplet_embedding_test_set_igblast.csv.
+
+# goal here is to get a relatively small sample of ideally antigen adapted sequences across covid, ms, and healthy pre 2020 from multiple studies
+# critical that triplet loss is calculated across studies, we don't want to be picking up technical similarity
+# also need to include protein sequences because ESM2 and antiberty are PLMs
+
+read_csv(data_path("metadata/allOPIGdefinedUnpairedMetadata.csv")) %>%
+  filter(Disease %in% c('CMV','Dengue','EBV','HCV','HIV','Light-Chain-Amyloidosis','MuSK-MG','None','POEMS','SARS-COV-2','SLE','CLL','Ebola','AChR-MG','MS')) %>%
+  mutate(Disease = if_else(Disease == 'None', 'Healthy', Disease)) %>% #prevent pandas issues
+  mutate(Year = as.numeric(str_extract(Author, "\\d{4}"))) %>%
+  select(file_name, Author, Year, Age, BSource, BType, Disease, Subject, Isotype) -> df
+
+opig <-
+  vroom(data_path("sequences/master-opig-dataset-sequence.csv")) %>%
+  select(file_name, v_call, sequence, junction, consensus_count, productive, complete_vdj, v_identity) %>%
+  filter(productive == T) %>%
+  filter(complete_vdj == T) %>%
+  filter(v_identity < 95) %>%
+  filter(consensus_count > 2) %>%
+  filter(str_starts(v_call, "IGH")) %>%
+  right_join(df, by = 'file_name') %>%
+  filter(!is.na(sequence), !is.na(Disease)) %>%
+  filter(Disease %in% c('SARS-COV-2', 'MuSK-MG', 'AChR-MG', 'SLE') | (Disease == 'Healthy' & Year < 2020)) %>%
+  ungroup()
+
+read_metadata() %>%
+  select(Run, BioProject, create_date, Tissue, `Cell Type`, Age, Sex, DonorID, Disease, `Disease Class`, Treatment, `Patient State`, EDSS, `Years disease`) -> metadata
+
+trust4 <- 
+  vroom(data_path("sequences/master-trust4-dataset-sequence.csv")) %>%
+  filter(productive == T) %>%
+  filter(complete_vdj == T) %>%
+  filter(v_identity < 95) %>%
+  filter(consensus_count > 2) %>%
+  filter(str_starts(v_call, "IGH")) %>%
+  mutate(SRA = str_extract(file_name, "(SRR|ERR)[0-9]+")) %>%
+  left_join(metadata, by = c('SRA' = 'Run')) %>%
+  filter(!is.na(sequence), !is.na(Disease))
+
+# Filter starting dataset
+trust4 <- 
+  trust4 %>%
+  mutate(Year = year(create_date)) %>%
+  mutate(Disease = if_else(Disease %in% c('Healthy','Control'), 'Healthy', Disease)) %>%
+  dplyr::rename(Author = BioProject) %>%
+  dplyr::rename(BSource = Tissue) %>%
+  dplyr::rename(BType = `Cell Type`) %>%
+  dplyr::rename(Isotype = c_call) %>%
+  mutate(Subject = paste(Age, Sex, DonorID)) %>%
+  filter((Disease == 'Multiple sclerosis' & BSource == 'CSF') | (Disease == 'Healthy' & Year < 2020)) %>%
+  ungroup()
+
+library(igblastr)
+#install_IMGT_germline_db('202531-1')
+use_germline_db("IMGT-202531-1.Homo_sapiens.IGH+IGK+IGL")
+use_c_region_db("_IMGT.human.IGH+IGK+IGL.202412")
+
+list(opig, trust4) %>%
+  map(select, 'sequence', 'Author', 'Disease', 'Subject') %>%
+  purrr::reduce(rbind) %>%
+  group_by(Author, Disease, Subject) %>%
+  slice_sample(n = 2000) -> embedding_ds
+  
+seqs <- DNAStringSet(embedding_ds$sequence)
+names(seqs) <- rep(1, nrow(embedding_ds))
+
+# Run igblastn
+igblast_results <- 
+  igblastn(
+  query = seqs,
+  organism = "human",
+  outfmt = "AIRR",
+  num_threads=16,
+  num_alignments_V=1,
+  num_alignments_C=1
+)
+ 
+igblast_results %>%
+  mutate(sequence = str_sub(sequence, v_sequence_start, j_sequence_end)) %>%
+  select(sequence, sequence_aa) %>%
+  bind_cols(embedding_ds[c('Author','Disease','Subject')])
+
+# Re-igblast to trim amino acids to trimmed sequence
+embedding_ds <- read_csv(data_path("embedding-comparison/triplet_embedding_test_set_igblast.csv")) 
+
+seqs <- DNAStringSet(embedding_ds$sequence)
+names(seqs) <- rep(1, nrow(embedding_ds))
+
+# Run igblastn
+igblast_results <- 
+  igblastn(
+  query = seqs,
+  organism = "human",
+  outfmt = "AIRR",
+  num_threads=4,
+  num_alignments_V=1,
+  num_alignments_C=1
+)
+
+igblast_results %>%
+  select(sequence, sequence_aa) %>%
+  bind_cols(embedding_ds[c('Author','Disease','Subject')])
+
+```
+
+
+
+```{r Fig 2C cosine similarity}
+set.seed(42)
+library(tidyverse)
+library(matrixStats)
+
+cosine_sim <- function(A, B) {
+  if (!all(dim(A) == dim(B))) stop("A and B must have the same dimensions")
+  numer <- rowSums2(A * B)
+  denom <- sqrt(rowSums2(A^2)) * sqrt(rowSums2(B^2))
+  numer / denom
+}
+
+inputs <- read_csv(data_path("embedding-comparison/triplet_embedding_test_set_igblast.csv"))
+mistral_embeddings        <- read_csv(out_path("embeddings/mistral-meanpooled-embeddings.csv"))
+esm2_embeddings <- read_csv(out_path("embeddings/esm2-meanpooled-embeddings.csv"))
+abroberta <- read_csv(out_path("embeddings/abroberta-meanpooled-embeddings.csv"))
+
+
+### Mistral ###
+bind_cols(inputs, mistral_embeddings) %>%
+  group_by(Disease) %>%
+  slice_sample(n = 10000, replace = T) %>%
+  ungroup() %>%
+  slice_sample(n = 75000) -> mistral1
+matrix1 <- as.matrix(mistral1[7:ncol(mistral1)])
+
+bind_cols(inputs, mistral_embeddings) %>%
+  group_by(Disease) %>%
+  slice_sample(n = 10000, replace = T) %>%
+  ungroup() %>%
+  slice_sample(n = 75000) -> mistral2
+matrix2 <- as.matrix(mistral2[7:ncol(mistral2)])
+
+similarities_mistral <-
+  cosine_sim(matrix1, matrix2)
+
+bind_cols(mistral1[3:6], mistral2[3:6]) %>%
+  mutate(similarity = similarities_mistral) %>%
+  filter(Disease...2 != 'Healthy' | Disease...6 != 'Healthy') %>% # remove healthy-healthy comparisons, not meaningful
+  #mutate(disease_study_match = if_else((Disease...2 == Disease...6 & Author...1 != Author...5), 'disease match, across study', 'other')) %>%
+  #mutate(disease_study_match = if_else((Disease...2 != Disease...6 & Author...1 != Author...5), 'disease mismatch, across study', disease_study_match)) %>%
+  mutate(disease_study_match = if_else((Disease...2 == Disease...6 & Subject...3 != Subject...7), 'disease match, across patients', 'other')) %>%
+  mutate(disease_study_match = if_else((Disease...2 != Disease...6 & Subject...3 != Subject...7), 'disease mismatch, across patients', disease_study_match)) %>%
+  #mutate(normalized_similarity = (similarity - mean(similarity[disease_study_match == 'disease mismatch, across study']))) %>%
+  mutate(normalized_similarity = (similarity - mean(similarity[disease_study_match == 'disease mismatch, across patients'])) / sd(similarity[disease_study_match == 'disease mismatch, across patients'])) %>%
+  mutate(model = 'bcr-mistral') -> mistral
+
+#######
+
+### ESM2 ###
+bind_cols(inputs, esm2_embeddings) %>%
+  group_by(Disease) %>%
+  slice_sample(n = 10000, replace = T) %>%
+  ungroup() %>%
+  slice_sample(n = 75000) -> esm1
+matrix1 <- as.matrix(esm1[7:ncol(esm1)])
+
+bind_cols(inputs, esm2_embeddings) %>%
+  group_by(Disease) %>%
+  slice_sample(n = 10000, replace = T) %>%
+  ungroup() %>%
+  slice_sample(n = 75000) -> esm2
+matrix2 <- as.matrix(esm2[7:ncol(esm2)])
+
+similarities_esm2 <-
+  cosine_sim(matrix1, matrix2)
+
+bind_cols(esm1[3:6], esm2[3:6]) %>%
+  mutate(similarity = similarities_esm2) %>%
+  filter(Disease...2 != 'Healthy' | Disease...6 != 'Healthy') %>% # remove healthy-healthy comparisons, not meaningful
+  #mutate(disease_study_match = if_else((Disease...2 == Disease...6 & Author...1 != Author...5), 'disease match, across study', 'other')) %>%
+  #mutate(disease_study_match = if_else((Disease...2 != Disease...6 & Author...1 != Author...5), 'disease mismatch, across study', disease_study_match)) %>%
+  mutate(disease_study_match = if_else((Disease...2 == Disease...6 & Subject...3 != Subject...7), 'disease match, across patients', 'other')) %>%
+  mutate(disease_study_match = if_else((Disease...2 != Disease...6 & Subject...3 != Subject...7), 'disease mismatch, across patients', disease_study_match)) %>%
+  #mutate(normalized_similarity = (similarity - mean(similarity[disease_study_match == 'disease mismatch, across study']))) %>%
+  mutate(normalized_similarity = (similarity - mean(similarity[disease_study_match == 'disease mismatch, across patients'])) / sd(similarity[disease_study_match == 'disease mismatch, across patients'])) %>%
+  mutate(model = 'esm2-650m') -> esm2
+
+########
+
+### ab-roberta ###
+bind_cols(inputs, abroberta) %>%
+  group_by(Disease) %>%
+  slice_sample(n = 10000, replace = T) %>%
+  ungroup() %>%
+  slice_sample(n = 75000) -> abroberta1
+matrix1 <- as.matrix(abroberta1[7:ncol(abroberta1)])
+
+bind_cols(inputs, abroberta) %>%
+  group_by(Disease) %>%
+  slice_sample(n = 10000, replace = T) %>%
+  ungroup() %>%
+  slice_sample(n = 75000) -> abroberta2
+matrix2 <- as.matrix(abroberta2[7:ncol(abroberta2)])
+
+similarities_abroberta <-
+  cosine_sim(matrix1, matrix2)
+
+bind_cols(abroberta1[3:6], abroberta2[3:6]) %>%
+  mutate(similarity = similarities_abroberta) %>%
+  filter(Disease...2 != 'Healthy' | Disease...6 != 'Healthy') %>% # remove healthy-healthy comparisons, not meaningful
+  #mutate(disease_study_match = if_else((Disease...2 == Disease...6 & Author...1 != Author...5), 'disease match, across study', 'other')) %>%
+  #mutate(disease_study_match = if_else((Disease...2 != Disease...6 & Author...1 != Author...5), 'disease mismatch, across study', disease_study_match)) %>%
+  mutate(disease_study_match = if_else((Disease...2 == Disease...6 & Subject...3 != Subject...7), 'disease match, across patients', 'other')) %>%
+  mutate(disease_study_match = if_else((Disease...2 != Disease...6 & Subject...3 != Subject...7), 'disease mismatch, across patients', disease_study_match)) %>%
+  #mutate(normalized_similarity = (similarity - mean(similarity[disease_study_match == 'disease mismatch, across study']))) %>%
+  mutate(normalized_similarity = (similarity - mean(similarity[disease_study_match == 'disease mismatch, across patients'])) / sd(similarity[disease_study_match == 'disease mismatch, across patients'])) %>%
+  mutate(model = 'ab-roberta') -> abroberta
+
+########
+
+p_cosine <- bind_rows(mistral, abroberta, esm2) %>%
+  #filter(Disease...2 == 'Multiple sclerosis' | Disease...6 == 'Multiple sclerosis') %>%
+  #filter(Disease...2 == 'SARS-COV-2' | Disease...6 == 'SARS-COV-2') %>%
+  #filter(Disease...2 == 'Healthy' | Disease...6 == 'Healthy') %>%
+  #filter(Disease...2 != 'Healthy' & Disease...6 != 'Healthy') %>%
+  filter(disease_study_match != 'other') %>%
+  filter(disease_study_match != 'disease mismatch, across patients') %>%
+  group_by(model, disease_study_match) %>%
+  summarize(boot_mean = replicate(100, mean(sample(normalized_similarity, replace = T))), .groups = "drop") %>%
+  mutate(disease_study_match = fct_rev(disease_study_match)) %>%
+  mutate(model = fct_reorder(model, boot_mean, max)) %>%
+  ggplot(aes(x = model, y = boot_mean, fill = disease_study_match)) +
+  geom_boxplot(outliers = F, notch = T) +
+  labs(y = 'Mean Z Scored Cosine Similarity', x = "") +
+  scale_fill_viridis_d() +
+  theme_linedraw(base_size = 8) +
+  theme(aspect.ratio = 1,
+        legend.position = 'none')   # one group (disease match across patients), as in the paper
+p_cosine
+
+# (The 300M diversified/undiversified/protein comparison is in the "300M plm" chunk below.)
+
+FIGURES_DIR <- out_path("figures")
+dir.create(FIGURES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+ggsave(file.path(FIGURES_DIR, "fig2C_embedding_comparison_cosine.svg"), p_cosine, width = 2.5, height = 2.5)
+  
+```
+
+```{r Triplet rank - accuracy}
+
+library(tidyverse)
+library(Rfast)
+library(glue)
+
+triplet_accuracy <- function(
+  embeddings_csv,
+  metadata_csv,
+  n_triplets = 5000,
+  distance = c("cosine", "euclidean")
+) {
+  distance <- match.arg(distance)
+  
+  message("Loading data...")
+  emb <- read_csv(embeddings_csv, show_col_types = FALSE)
+  meta <- read_csv(metadata_csv, show_col_types = FALSE)
+  
+  # Ensure same number of rows
+  stopifnot(nrow(meta) == nrow(emb))
+  df <- bind_cols(meta, emb)
+  
+  stopifnot(all(c("Disease", "Subject") %in% colnames(df)))
+  
+  X <- df %>% select(starts_with("hidden_state_")) %>% as.matrix()
+  diseases <- df$Disease
+  authors <- df$Subject
+  unique_diseases <- unique(diseases)
+  
+  # balanced sampling per Disease
+  n_per_class <- ceiling(n_triplets / length(unique_diseases))
+  set.seed(123)
+  
+  message("Sampling anchors with replacement (balanced by Disease)...")
+  triplets <- map_dfr(unique_diseases, function(d) {
+    anchor_idx <- which(diseases == d)
+    if (length(anchor_idx) < 2) return(tibble())
+    
+    # sample anchors with replacement
+    sampled_anchors <- sample(anchor_idx, n_per_class, replace = TRUE)
+    
+    tibble(
+      anchor = sampled_anchors,
+      positive = map_int(sampled_anchors, function(a_idx) {
+        candidates <- which(diseases == d & authors != authors[a_idx])
+        if (length(candidates) == 0) return(NA_integer_)
+        sample(candidates, 1)
+      }),
+      negative = map_int(sampled_anchors, function(a_idx) {
+        candidates <- which(diseases != d & authors != authors[a_idx])
+        if (length(candidates) == 0) return(NA_integer_)
+        sample(candidates, 1)
+      }),
+      disease = d
+    )
+  })
+  
+  triplets <- triplets %>% drop_na()
+  message(glue("Using {nrow(triplets)} valid triplets after filtering."))
+  
+  if (nrow(triplets) == 0) {
+    stop("No valid triplets found given your constraints.")
+  }
+  
+  message("Computing distances...")
+  anchor_emb <- X[triplets$anchor, , drop = FALSE]
+  pos_emb    <- X[triplets$positive, , drop = FALSE]
+  neg_emb    <- X[triplets$negative, , drop = FALSE]
+  
+  if (distance == "euclidean") {
+    d_pos <- sqrt(rowSums((anchor_emb - pos_emb)^2))
+    d_neg <- sqrt(rowSums((anchor_emb - neg_emb)^2))
+  } else {  # cosine
+    normalize <- function(m) m / sqrt(rowSums(m^2))
+    A <- normalize(anchor_emb)
+    P <- normalize(pos_emb)
+    N <- normalize(neg_emb)
+    d_pos <- 1 - rowSums(A * P)
+    d_neg <- 1 - rowSums(A * N)
+  }
+  
+  correct <- d_neg / d_pos #d_pos < d_neg
+  triplets$correct <- correct
+  
+  acc <- mean(correct)
+  per_class <- triplets %>%
+    group_by(disease) %>%
+    summarise(n = n(), accuracy = mean(correct), .groups = "drop")
+  
+  message(glue("Overall triplet accuracy: {round(acc * 100, 2)}%"))
+  print(per_class)
+  
+  invisible(list(
+    overall_accuracy = acc,
+    per_class = per_class,
+    triplets = triplets
+  ))
+}
+
+resRoberta <- triplet_accuracy(
+  embeddings_csv = out_path("embeddings/abroberta-meanpooled-embeddings.csv"),
+  metadata_csv   = data_path("embedding-comparison/triplet_embedding_test_set_igblast.csv"),
+  n_triplets = 50000,
+  distance = "euclidean"
+)
+resRoberta <-
+  resRoberta$triplets %>%
+  mutate(model = 'ab-roberta')
+
+resEsm2 <- triplet_accuracy(
+  embeddings_csv = out_path("embeddings/esm2-meanpooled-embeddings.csv"),
+  metadata_csv   = data_path("embedding-comparison/triplet_embedding_test_set_igblast.csv"),
+  n_triplets = 50000,
+  distance = "euclidean"
+)
+resEsm2 <-
+  resEsm2$triplets %>%
+  mutate(model = 'esm2-650m')
+
+resMistral <- triplet_accuracy(
+  embeddings_csv = out_path("embeddings/mistral-meanpooled-embeddings.csv"),
+  metadata_csv = data_path("embedding-comparison/triplet_embedding_test_set_igblast.csv"),
+  n_triplets = 50000,
+  distance = "euclidean"
+)
+resMistral <-
+  resMistral$triplets %>%
+  mutate(model = 'bcr-mistral')
+
+list(resMistral, resEsm2, resRoberta) %>%
+  purrr::reduce(bind_rows) %>%
+  group_by(model) %>% #disease
+  summarize(mean_accuracy = replicate(100, mean(sample(correct, replace = T))), .groups = "drop") %>%
+  ungroup() %>%
+  mutate(model = fct_reorder(model, mean_accuracy, mean)) %>%
+  ggplot(aes(y = mean_accuracy, fill = model, x = model)) +
+  geom_boxplot(outliers = F) +
+  #facet_wrap(vars(disease)) +
+  theme_linedraw(base_size = 8) +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = 'none') +
+  geom_hline(yintercept = 1) +
+  labs(x = "", y = "Neg. Distance / Pos. Distance")
+
+FIGURES_DIR <- out_path("figures")
+dir.create(FIGURES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+ggsave(file.path(FIGURES_DIR, "fig2C_embedding_comparison_triplet.svg"), width = 2.5, height = 2.5)
+
+```
+
+```{r 300M plm and universified models}
+# The models the paper called 300M hold 151M parameters (counted from their config); the labels
+# below say 151m. The chunk after this one repeats the comparison for the 304M replications.
+set.seed(42)
+library(tidyverse)
+library(matrixStats)
+
+cosine_sim <- function(A, B) {
+  if (!all(dim(A) == dim(B))) stop("A and B must have the same dimensions")
+  numer <- rowSums2(A * B)
+  denom <- sqrt(rowSums2(A^2)) * sqrt(rowSums2(B^2))
+  numer / denom
+}
+
+inputs <- read_csv(data_path("embedding-comparison/triplet_embedding_test_set_igblast.csv"))
+mistral_300m_embeddings   <- read_csv(out_path("embeddings/mistral-meanpooled-embeddings-300M.csv"))
+mistral_300m_undiv_embeddings <- read_csv(out_path("embeddings/mistral-meanpooled-embeddings-300M-undiversified.csv"))
+mistral_plm_embeddings        <- read_csv(out_path("embeddings/mistral-meanpooled-embeddings-protein.csv"))
+
+### bcr-mistral-300m ###
+bind_cols(inputs, mistral_300m_embeddings) %>%
+  group_by(Disease) %>%
+  slice_sample(n = 10000, replace = T) %>%
+  ungroup() %>%
+  slice_sample(n = 75000) -> mistral_300m_1
+matrix1 <- as.matrix(mistral_300m_1[7:ncol(mistral_300m_1)])
+
+bind_cols(inputs, mistral_300m_embeddings) %>%
+  group_by(Disease) %>%
+  slice_sample(n = 10000, replace = T) %>%
+  ungroup() %>%
+  slice_sample(n = 75000) -> mistral_300m_2
+matrix2 <- as.matrix(mistral_300m_2[7:ncol(mistral_300m_2)])
+
+similarities_mistral_300m <-
+  cosine_sim(matrix1, matrix2)
+
+bind_cols(mistral_300m_1[3:6], mistral_300m_2[3:6]) %>%
+  mutate(similarity = similarities_mistral_300m) %>%
+  filter(Disease...2 != 'Healthy' | Disease...6 != 'Healthy') %>%
+  mutate(disease_study_match = if_else((Disease...2 == Disease...6 & Subject...3 != Subject...7), 'disease match, across patients', 'other')) %>%
+  mutate(disease_study_match = if_else((Disease...2 != Disease...6 & Subject...3 != Subject...7), 'disease mismatch, across patients', disease_study_match)) %>%
+  mutate(normalized_similarity = (similarity - mean(similarity[disease_study_match == 'disease mismatch, across patients'])) / sd(similarity[disease_study_match == 'disease mismatch, across patients'])) %>%
+  mutate(model = 'bcr-mistral-151m') -> mistral_300m
+
+########
+
+### bcr-mistral-300m-undiv ###
+bind_cols(inputs, mistral_300m_undiv_embeddings) %>%
+  group_by(Disease) %>%
+  slice_sample(n = 10000, replace = T) %>%
+  ungroup() %>%
+  slice_sample(n = 75000) -> mistral_300m_undiv_1
+matrix1 <- as.matrix(mistral_300m_undiv_1[7:ncol(mistral_300m_undiv_1)])
+
+bind_cols(inputs, mistral_300m_undiv_embeddings) %>%
+  group_by(Disease) %>%
+  slice_sample(n = 10000, replace = T) %>%
+  ungroup() %>%
+  slice_sample(n = 75000) -> mistral_300m_undiv_2
+matrix2 <- as.matrix(mistral_300m_undiv_2[7:ncol(mistral_300m_undiv_2)])
+
+similarities_mistral_300m_undiv <-
+  cosine_sim(matrix1, matrix2)
+
+bind_cols(mistral_300m_undiv_1[3:6], mistral_300m_undiv_2[3:6]) %>%
+  mutate(similarity = similarities_mistral_300m_undiv) %>%
+  filter(Disease...2 != 'Healthy' | Disease...6 != 'Healthy') %>%
+  mutate(disease_study_match = if_else((Disease...2 == Disease...6 & Subject...3 != Subject...7), 'disease match, across patients', 'other')) %>%
+  mutate(disease_study_match = if_else((Disease...2 != Disease...6 & Subject...3 != Subject...7), 'disease mismatch, across patients', disease_study_match)) %>%
+  mutate(normalized_similarity = (similarity - mean(similarity[disease_study_match == 'disease mismatch, across patients'])) / sd(similarity[disease_study_match == 'disease mismatch, across patients'])) %>%
+  mutate(model = 'bcr-mistral-151m-undiv') -> mistral_300m_undiv
+
+### bcr-mistral-300m-plm ###
+bind_cols(inputs, mistral_plm_embeddings) %>%
+  group_by(Disease) %>%
+  slice_sample(n = 10000, replace = T) %>%
+  ungroup() %>%
+  slice_sample(n = 75000) -> mistral_300m_plm_1
+matrix1 <- as.matrix(mistral_300m_plm_1[7:ncol(mistral_300m_plm_1)])
+
+bind_cols(inputs, mistral_plm_embeddings) %>%
+  group_by(Disease) %>%
+  slice_sample(n = 10000, replace = T) %>%
+  ungroup() %>%
+  slice_sample(n = 75000) -> mistral_300m_plm_2
+matrix2 <- as.matrix(mistral_300m_plm_2[7:ncol(mistral_300m_plm_2)])
+
+similarities_mistral_300m_plm <-
+  cosine_sim(matrix1, matrix2)
+
+bind_cols(mistral_300m_plm_1[3:6], mistral_300m_plm_2[3:6]) %>%
+  mutate(similarity = similarities_mistral_300m_plm) %>%
+  filter(Disease...2 != 'Healthy' | Disease...6 != 'Healthy') %>%
+  mutate(disease_study_match = if_else((Disease...2 == Disease...6 & Subject...3 != Subject...7), 'disease match, across patients', 'other')) %>%
+  mutate(disease_study_match = if_else((Disease...2 != Disease...6 & Subject...3 != Subject...7), 'disease mismatch, across patients', disease_study_match)) %>%
+  mutate(normalized_similarity = (similarity - mean(similarity[disease_study_match == 'disease mismatch, across patients'])) / sd(similarity[disease_study_match == 'disease mismatch, across patients'])) %>%
+  mutate(model = 'bcr-mistral-151m-plm') -> mistral_300m_plm
+
+########
+
+bind_rows(mistral_300m, mistral_300m_plm) %>%
+  #filter(Disease...2 == 'Multiple sclerosis' | Disease...6 == 'Multiple sclerosis') %>%
+  #filter(Disease...2 == 'SARS-COV-2' | Disease...6 == 'SARS-COV-2') %>%
+  #filter(Disease...2 == 'Healthy' | Disease...6 == 'Healthy') %>%
+  #filter(Disease...2 != 'Healthy' & Disease...6 != 'Healthy') %>%
+  filter(disease_study_match != 'other') %>%
+  filter(disease_study_match != 'disease mismatch, across patients') %>%
+  group_by(model, disease_study_match) %>%
+  summarize(boot_mean = replicate(1000, mean(sample(normalized_similarity, replace = T))), .groups = "drop") %>%
+  mutate(disease_study_match = fct_rev(disease_study_match)) %>%
+  mutate(model = fct_reorder(model, boot_mean, max)) %>%
+  ggplot(aes(x = model, y = boot_mean, fill = disease_study_match)) +
+  geom_boxplot(outliers = F, notch = T) +
+  labs(y = 'Mean Z Scored Cosine Similarity', x = "") +
+  scale_fill_viridis_d() +
+  theme_linedraw(base_size = 14) +
+  theme(aspect.ratio = 1,
+        legend.position = 'bottom')
+
+
+FIGURES_DIR <- out_path("figures")
+dir.create(FIGURES_DIR, showWarnings = FALSE, recursive = TRUE)
+
+ggsave(file.path(FIGURES_DIR, "figS1A_embedding_comparison_300M_variants.svg"), width = 2.5, height = 2.5)
+  
+```
+
+```{r S1A with correctly sized 304M models, eval = file.exists(out_path("embeddings/mistral-meanpooled-embeddings-300M-1024x20.csv"))}
+# Same procedure as the chunk above, for the correctly sized 304M models
+# (foundation-models/train_300M*_1024x20.py; embeddings/extract_mistral_1024x20_pooled.py).
+set.seed(42)
+z_scored_similarity <- function(embeddings, model_name) {
+  draw <- function() bind_cols(inputs, embeddings) %>%
+    group_by(Disease) %>% slice_sample(n = 10000, replace = T) %>% ungroup() %>% slice_sample(n = 75000)
+  a <- draw(); b <- draw()
+  bind_cols(a[3:6], b[3:6]) %>%
+    mutate(similarity = cosine_sim(as.matrix(a[7:ncol(a)]), as.matrix(b[7:ncol(b)]))) %>%
+    filter(Disease...2 != 'Healthy' | Disease...6 != 'Healthy') %>%
+    mutate(disease_study_match = if_else((Disease...2 == Disease...6 & Subject...3 != Subject...7), 'disease match, across patients', 'other')) %>%
+    mutate(disease_study_match = if_else((Disease...2 != Disease...6 & Subject...3 != Subject...7), 'disease mismatch, across patients', disease_study_match)) %>%
+    mutate(normalized_similarity = (similarity - mean(similarity[disease_study_match == 'disease mismatch, across patients'])) / sd(similarity[disease_study_match == 'disease mismatch, across patients'])) %>%
+    mutate(model = model_name)
+}
+
+sized <- c(`bcr-mistral-304m` = "300M-1024x20", `bcr-mistral-304m-undiv` = "300M-1024x20-undiversified",
+           `bcr-mistral-304m-plm` = "300M-1024x20-protein")
+sized <- sized[file.exists(out_path(paste0("embeddings/mistral-meanpooled-embeddings-", sized, ".csv")))]
+sized_similarities <- imap(sized, ~ z_scored_similarity(read_csv(out_path(paste0("embeddings/mistral-meanpooled-embeddings-", .x, ".csv"))), .y))
+
+bind_rows(sized_similarities) %>%
+  filter(disease_study_match == 'disease match, across patients') %>%
+  group_by(model) %>%
+  summarize(boot_mean = replicate(1000, mean(sample(normalized_similarity, replace = T))), .groups = "drop") %>%
+  mutate(model = fct_reorder(model, boot_mean, max)) %>%
+  ggplot(aes(x = model, y = boot_mean)) +
+  geom_boxplot(outliers = F, notch = T, fill = viridisLite::viridis(1)) +
+  labs(y = 'Mean Z Scored Cosine Similarity', x = "") +
+  theme_linedraw(base_size = 14) +
+  theme(aspect.ratio = 1, axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(FIGURES_DIR, "figS1A_embedding_comparison_300M_variants_sized.svg"), width = 2.5, height = 2.5)
+```
